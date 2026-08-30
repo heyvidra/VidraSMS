@@ -1,0 +1,6 @@
+.dev.vars
+.wrangler/
+node_modules/
+.sms_key
+.apk_code
+.env

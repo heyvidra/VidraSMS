@@ -1,0 +1,38 @@
+name = "sms-forward"
+main = "src/index.js"
+compatibility_date = "2026-02-19"
+
+# Binds the Worker to your own hostname on deploy, so there is no dashboard step — and
+# nothing ever depends on *.workers.dev, which is DNS-poisoned in mainland China.
+# The zone must already be Active on Cloudflare (nameservers moved) or deploy fails.
+routes = [
+  { pattern = "777310753.xyz", custom_domain = true },
+  { pattern = "20150411.xyz", custom_domain = true },
+]
+
+# Must match NTFY_TOPIC in android/local.properties. A mismatch 404s, which the phone
+# turns into a visible "forwarding failed" notification rather than silence.
+[vars]
+TOPIC = "sms-7f3a9c2b1e0d"
+VAPID_PUBLIC = "BB_SGZKhZ5juUJeP1WGi5oDu7Sc9juXpthw3ikLIOg1lN63VrKksyGw3U5eN_8VGOCmPk8Dew2whRcLbpI6am2g"
+VAPID_SUBJECT = "mailto:admin@777310753.xyz"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "sms"
+database_id = "f503dfb8-c45d-4f1f-83dd-62344020e2c8"
+
+# Secrets (never in this file — set with `wrangler secret put NAME`):
+#   SEND_TOKEN  the phone's bearer token
+#   WEB_USER    username for viewing the page
+#   WEB_PASS    password for viewing the page
+
+[[kv_namespaces]]
+binding = "APK"
+id = "20d1dbebf7b74d4186270b5fc28cea77"
+
+# 定时保号: the scheduled() handler checks the web-set schedule and queues the 保号 SMS into the
+# outbox when due. Every 15 min so a chosen time is honoured within the quarter-hour; the handler
+# no-ops until the web switch is on, so this never sends on its own.
+[triggers]
+crons = ["*/15 * * * *"]

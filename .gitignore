@@ -1,0 +1,20 @@
+# Secrets & local machine config — never commit
+android/local.properties
+
+# Android build output
+android/.gradle/
+android/build/
+android/app/build/
+android/.idea/
+*.iml
+
+# Server runtime data (ntfy user db, caddy certs) lives in Docker volumes, not here
+
+# Cloudflare Worker
+worker/.wrangler/
+worker/.dev.vars
+worker/node_modules/
+
+# Android release signing — never commit these
+android/release.keystore
+android/keystore.properties

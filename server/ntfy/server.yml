@@ -1,0 +1,21 @@
+# Replace the domain below with yours (must match the Caddyfile).
+base-url: "https://ntfy.yourdomain.com"
+
+# ntfy listens on plain HTTP inside the container; Caddy terminates TLS.
+listen-http: ":80"
+behind-proxy: true
+
+# Auth: nothing is readable/writable without a login. This is the key line.
+auth-file: "/var/lib/ntfy/user.db"
+auth-default-access: "deny-all"
+
+# Lets you log in from the web app / clients. Signup stays off, so only accounts you
+# create with `ntfy user add` exist — nobody can self-register on your server.
+enable-login: true
+enable-signup: false
+
+# How long the server keeps messages. This is what you scroll back through in the web
+# app, so it is the only thing standing between you and a lost code — not a cache in the
+# throwaway sense. Raise it if you want a longer history.
+cache-file: "/var/lib/ntfy/cache.db"
+cache-duration: "24h"

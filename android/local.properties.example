@@ -1,0 +1,14 @@
+# Android Studio auto-fills sdk.dir here. Add the three NTFY_ lines below.
+# This file (local.properties) is gitignored, so your token never lands in source.
+#
+# NOTE: comments must be on their OWN line. java.util.Properties has no inline
+# comments, so "KEY=value # note" makes the note part of the value.
+
+# Must start with https:// — the app refuses to send over plaintext.
+NTFY_URL=https://ntfy.yourdomain.com
+
+# Pick a long random topic name, not "sms".
+NTFY_TOPIC=sms-7f3a9c2b1e0d
+
+# From: docker compose exec ntfy ntfy token add me
+NTFY_TOKEN=tk_xxxxxxxxxxxxxxxxxxxx

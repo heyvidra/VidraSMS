@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Primary capture is the notification listener (no restricted permission, works on a
+         sideloaded install). RECEIVE_SMS only powers the fallback broadcast path, which fires
+         when the permission is actually held (adb install / default-SMS app). -->
+    <uses-permission android:name="android.permission.RECEIVE_SMS" />
+    <!-- Sending is only reachable once the app is the default SMS app (which exempts it from
+         the hard SMS-permission restriction); the outbox is polled and sent from there. -->
+    <uses-permission android:name="android.permission.SEND_SMS" />
+    <!-- Only to map a chosen SIM slot to its subscription when sending on a dual-SIM phone;
+         optional — falls back to the default SIM if not granted. -->
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Only used to tell you that syncing broke; never to show SMS contents. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Lets the app pop the one-tap "ignore battery optimizations" dialog, so the listener
+         isn't killed in Doze. Restricted on Play, fine for a sideloaded personal app. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- The keep-alive foreground service (ForwardService) hosts the outbox poller + heartbeat.
+         specialUse is the only type with no daily runtime cap and still startable from boot. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Restart the service after a reboot / app update, so forwarding never silently stops. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- The poll alarm has to wake a sleeping phone on time; without an exact alarm the system
+         gives it a 45s window and a web-sent SMS waits a minute. Degrades gracefully when 33+
+         withholds it. -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+
+    <application
+        android:label="验证码"
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Keep-alive host: foreground service running the outbox poller + heartbeat. Not
+             exported; started by MainActivity, BootReceiver, CodeListener, and START_STICKY. -->
+        <service
+            android:name=".ForwardService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="personal SMS forwarder: polls an encrypted outbox and heartbeats" />
+        </service>
+
+        <!-- Restarts ForwardService after reboot or an app update. -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Reads incoming-SMS notifications. The BIND permission is held by the system, and the
+             user turns this on under Settings → Notification access. -->
+        <service
+            android:name=".CodeListener"
+            android:exported="true"
+            android:label="验证码"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+        <!-- SMS capture. SMS_RECEIVED reaches every RECEIVE_SMS holder; SMS_DELIVER reaches only
+             the default SMS app. Both funnel into forwardNow, which dedups. -->
+        <receiver
+            android:name=".IncomingReceiver"
+            android:exported="true"
+            android:permission="android.permission.BROADCAST_SMS">
+            <intent-filter android:priority="999">
+                <action android:name="android.provider.Telephony.SMS_RECEIVED" />
+            </intent-filter>
+            <intent-filter android:priority="999">
+                <action android:name="android.provider.Telephony.SMS_DELIVER" />
+            </intent-filter>
+        </receiver>
+
+        <!-- The remaining three components exist only to make the app eligible as the default
+             SMS app; on a dedicated forwarding phone they are stubs that do nothing. -->
+        <receiver
+            android:name=".MmsReceiver"
+            android:exported="true"
+            android:permission="android.permission.BROADCAST_WAP_PUSH">
+            <intent-filter>
+                <action android:name="android.provider.Telephony.WAP_PUSH_DELIVER" />
+                <data android:mimeType="application/vnd.wap.mms-message" />
+            </intent-filter>
+        </receiver>
+
+        <activity android:name=".ComposeActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.SENDTO" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="sms" />
+                <data android:scheme="smsto" />
+                <data android:scheme="mms" />
+                <data android:scheme="mmsto" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".HeadlessSmsSendService"
+            android:exported="true"
+            android:permission="android.permission.SEND_RESPOND_VIA_MESSAGE">
+            <intent-filter>
+                <action android:name="android.intent.action.RESPOND_VIA_MESSAGE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="sms" />
+                <data android:scheme="smsto" />
+                <data android:scheme="mms" />
+                <data android:scheme="mmsto" />
+            </intent-filter>
+        </service>
+    </application>
+</manifest>

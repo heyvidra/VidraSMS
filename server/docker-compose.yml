@@ -1,0 +1,28 @@
+services:
+  ntfy:
+    # Pinned on purpose: this container owns your user/token database, and an unattended
+    # major upgrade is not something you want to discover via missing OTPs.
+    image: binwiederhier/ntfy:v2.27.0
+    command: serve
+    environment:
+      - TZ=UTC
+    volumes:
+      - ./ntfy/server.yml:/etc/ntfy/server.yml:ro
+      - ntfy-data:/var/lib/ntfy
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.8
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
+
+volumes:
+  ntfy-data:
+  caddy-data:
+  caddy-config:
