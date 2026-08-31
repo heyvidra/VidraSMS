@@ -108,6 +108,7 @@ class ForwardService : Service() {
                     noteNetwork(applicationContext, screenOff, hasInternet(applicationContext))
                 }
                 runCatching { pollOutbox(applicationContext) }
+                runCatching { Updater.maybeCheck(applicationContext) }
             } finally {
                 runCatching { if (wl?.isHeld == true) wl.release() }
                 schedule()

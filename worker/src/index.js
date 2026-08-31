@@ -437,6 +437,31 @@ export default {
       });
     }
 
+    // In-app updater. The phone is already Bearer-authed (same SEND_TOKEN it uses for every
+    // /api call), so it pulls the version + APK straight, bypassing the human download-code gate.
+    // Additive: existing builds never call this, so shipping it changes nothing for them.
+    //   GET /api/app?meta=1 -> {"code":<versionCode>,"name":"<versionName>"} (set by upload-apk.sh)
+    //   GET /api/app        -> the APK bytes
+    if (path === "/api/app") {
+      const auth = request.headers.get("Authorization") || "";
+      if (!env.SEND_TOKEN || !auth.startsWith("Bearer ") || !safeEqual(auth.slice(7), env.SEND_TOKEN)) {
+        return new Response('{"error":"unauthorized"}', { status: 401, headers: { "Content-Type": "application/json" } });
+      }
+      if (new URL(request.url).searchParams.get("meta")) {
+        const meta = await env.APK?.get("appmeta");
+        return new Response(meta || '{"code":0,"name":""}', { headers: { "Content-Type": "application/json" } });
+      }
+      const apk = await env.APK?.get("app", "arrayBuffer");
+      if (!apk) return new Response("APK not uploaded", { status: 404 });
+      return new Response(apk, {
+        headers: {
+          "Content-Type": "application/vnd.android.package-archive",
+          "Content-Length": String(apk.byteLength),
+          "Cache-Control": "no-cache",
+        },
+      });
+    }
+
     // APK download, gated by a short code (not the full login). The APK embeds NTFY_TOKEN
     // and SMS_KEY, so this stops a random URL-guesser from grabbing it. Handled before the
     // publish catch-all so POST /app isn't mistaken for a phone upload. The code is checked

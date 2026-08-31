@@ -36,8 +36,8 @@ android {
         // Bump BOTH on every build so a phone's version is unambiguous — it rides up to the web
         // device card via BuildConfig.VERSION_NAME. versionCode must strictly increase for an
         // in-place update to install; versionName is what a human reads.
-        versionCode = 13
-        versionName = "1.6"
+        versionCode = 16
+        versionName = "1.9"
 
         buildConfigField("String", "NTFY_URL", quote(cfg("NTFY_URL")))
         buildConfigField("String", "NTFY_TOPIC", quote(cfg("NTFY_TOPIC")))
@@ -74,5 +74,6 @@ android {
 
 dependencies {
     implementation("androidx.work:work-runtime-ktx:2.9.1")
+    implementation("androidx.core:core:1.13.1")   // FileProvider for the in-app updater
     testImplementation("junit:junit:4.13.2")
 }

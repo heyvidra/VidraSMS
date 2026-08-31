@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Exposes the app's cache dir so FileProvider can hand the downloaded update.apk to the
+     package installer. cache-path only — nothing else is shared. -->
+<paths>
+    <cache-path name="apk" path="." />
+</paths>

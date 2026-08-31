@@ -12,6 +12,10 @@
          optional — falls back to the default SIM if not granted. -->
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- In-app updater: launch the system package installer for the downloaded APK. The install
+         itself still needs the user's explicit tap — this only lets the app start that flow. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!-- Only used to tell you that syncing broke; never to show SMS contents. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Lets the app pop the one-tap "ignore battery optimizations" dialog, so the listener
@@ -32,6 +36,17 @@
         android:label="验证码"
         android:icon="@mipmap/ic_launcher"
         android:allowBackup="false">
+
+        <!-- Serves the downloaded update APK to the package installer via a content:// URI. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
         <activity
             android:name=".MainActivity"

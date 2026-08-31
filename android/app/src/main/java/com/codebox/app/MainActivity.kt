@@ -110,6 +110,21 @@ class MainActivity : Activity() {
         edgeToEdge(outer)
 
         requestNeededPermissions()
+        handleUpdateIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleUpdateIntent(intent)
+    }
+
+    // The "发现新版本" notification opens the app with this extra; go straight to download+install.
+    private fun handleUpdateIntent(intent: Intent?) {
+        if (intent?.getBooleanExtra(Updater.EXTRA_UPDATE, false) == true) {
+            intent.removeExtra(Updater.EXTRA_UPDATE)   // don't re-trigger on rotation/resume
+            Updater.downloadAndInstall(this)
+        }
     }
 
     // Full-bleed: the background runs behind the status bar and the gesture bar, and the content
@@ -208,6 +223,10 @@ class MainActivity : Activity() {
             requestBatteryExempt()
         }
         render()
+        // Opening the app is a good moment to check for a new version — do it off the main thread
+        // (network) and re-render if one appeared, so the "发现新版本" banner shows without waiting
+        // for the background cycle.
+        Thread { if (Updater.checkOnOpen(applicationContext)) runOnUiThread { render() } }.start()
         val filter = IntentFilter(NEW_ACTION)
         // Our own broadcast, so NOT_EXPORTED is correct (and forwardNow sets the package).
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(newArrived, filter, Context.RECEIVER_NOT_EXPORTED)
@@ -407,6 +426,15 @@ class MainActivity : Activity() {
     private fun render() {
         root.removeAllViews()   // headerView lives outside the scroll area and is never rebuilt
 
+        // In-app update: shown first when a newer build is known (learned by the background poll).
+        // Tapping downloads the signed APK and hands it to the system installer — the user still
+        // confirms the install there; Android does not allow a sideload to install silently.
+        if (Updater.updateAvailable(this)) {
+            root.addView(banner("发现新版本 v${Updater.latestName(this)}，点此下载并安装。") {
+                Updater.downloadAndInstall(this)
+            })
+        }
+
         // A nudge, NOT a gate. Notification access is only one of two capture paths — the default
         // SMS app / RECEIVE_SMS broadcast captures without it — so returning here hid the whole
         // code list on a phone that was in fact storing and forwarding codes. It only genuinely
@@ -468,9 +496,34 @@ class MainActivity : Activity() {
             text = "点按数字复制"; textSize = 12.5f; setTextColor(muted)
             setPadding(dp(10), dp(6), 0, 0)
         }
+        val check = TextView(this).apply {
+            text = "检查更新"; textSize = 13f; setTextColor(accent)
+            setPadding(dp(8), dp(6), 0, 0)
+            setOnClickListener { checkForUpdate() }
+        }
         row.addView(title, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
         row.addView(sub, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        row.addView(check, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
         return row
+    }
+
+    // Explicit "check for updates" — hits the server now (no waiting on the 6h cycle), with a toast
+    // for each outcome. On finding a newer build the banner appears via render().
+    private fun checkForUpdate() {
+        Toast.makeText(this, "正在检查更新…", Toast.LENGTH_SHORT).show()
+        Thread {
+            val code = Updater.forceCheck(applicationContext)
+            runOnUiThread {
+                when {
+                    code == null -> Toast.makeText(this, "检查失败，请稍后重试", Toast.LENGTH_SHORT).show()
+                    code > BuildConfig.VERSION_CODE -> {
+                        render()
+                        Toast.makeText(this, "发现新版本 v" + Updater.latestName(this), Toast.LENGTH_SHORT).show()
+                    }
+                    else -> Toast.makeText(this, "已是最新版本（v" + BuildConfig.VERSION_NAME + "）", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }.start()
     }
 
     private fun codeCard(item: CodeItem): View {
