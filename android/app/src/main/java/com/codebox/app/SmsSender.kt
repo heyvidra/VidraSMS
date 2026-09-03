@@ -99,9 +99,9 @@ fun sendSms(ctx: Context, to: String, body: String, slot: Int?): Pair<Boolean, S
         }
         sm.sendMultipartTextMessage(to, null, ArrayList(parts), sentIntents, null)
 
-        if (!latch.await(60, TimeUnit.SECONDS)) return false to "超时"
+        if (!latch.await(60, TimeUnit.SECONDS)) return false to "超时未回执（信号弱/无服务）"
         val bad = codes.firstOrNull { it != Activity.RESULT_OK }
-        if (bad != null) return false to "结果码 $bad"
+        if (bad != null) return false to smsErr(bad)
         // Being the default SMS app also means owning the record of what was sent — without this
         // the message would leave the phone without appearing in any conversation on it.
         storeSent(ctx, to, body, subIdForSlot(ctx, slot) ?: -1)
@@ -111,6 +111,24 @@ fun sendSms(ctx: Context, to: String, body: String, slot: Int?): Pair<Boolean, S
     } finally {
         runCatching { ctx.unregisterReceiver(receiver) }
     }
+}
+
+// Human-readable SMS send failure, so the web shows WHY a send failed instead of a bare code.
+private fun smsErr(code: Int): String = when (code) {
+    SmsManager.RESULT_ERROR_GENERIC_FAILURE -> "通用失败(1)"
+    SmsManager.RESULT_ERROR_RADIO_OFF -> "射频关闭/飞行模式(2)"
+    SmsManager.RESULT_ERROR_NULL_PDU -> "空PDU(3)"
+    SmsManager.RESULT_ERROR_NO_SERVICE -> "无服务/无信号(4)"
+    else -> "结果码 $code"
+}
+
+// Remember the last send outcome on the device, so it rides up in the devinfo blob and shows on the
+// web card even when the outbox row only got the server's generic "多次尝试未送达" (which fires when
+// the phone was killed mid-send and never acked). This is the real, per-attempt reason.
+private fun recordLastSend(ctx: Context, ok: Boolean, detail: String) {
+    val label = if (ok) "成功" else "失败：$detail"
+    ctx.applicationContext.getSharedPreferences("dev", Context.MODE_PRIVATE)
+        .edit().putString("lastSend", label).apply()
 }
 
 // Pull pending sends, send each, ack. Called on a background thread by CodeListener's poller.
@@ -132,10 +150,90 @@ fun pollOutbox(ctx: Context) {
             val (ok, detail) = if (cmd == null) false to "解密失败"
                 else sendSms(ctx, cmd.optString("to"), cmd.optString("body"), slotOf(cmd.optString("sim")))
             ackOutbox(base, id, ok, detail)
+            recordLastSend(ctx, ok, detail)
         }
+        runCatching { pollDeletions(ctx, base) }
         return
     }
 }
+
+// Mirror web deletions onto this phone. A message can live in three places here: our own list
+// (CodeStore), the system SMS database (only if we were the default SMS app when it arrived — and
+// only a default app may delete from it), and the web. A web delete queues an encrypted row; we
+// decrypt it and remove the local copies.
+//
+// Two cursors. `hw` advances once our own list is cleaned — always possible. `hwSys` advances only
+// when we could also clean the system SMS, i.e. we are default: a phone that is NOT default right
+// now keeps those rows pending and finishes them when it becomes default again. A single cursor
+// skipped them for good — the "手机上没删" the user saw on a phone whose default keeps dropping.
+// A phone that was never default has no system copies, so it advances both (no pointless retry).
+private fun pollDeletions(ctx: Context, base: String) {
+    val p = ctx.getSharedPreferences("del", Context.MODE_PRIVATE)
+    val hw = p.getLong("hw", 0L)
+    val hwSys = p.getLong("hwSys", 0L)
+    val since = minOf(hw, hwSys)
+    val json = httpGet("$base/api/deletions?since=$since") ?: return
+    val arr = try { JSONArray(json) } catch (e: Exception) { return }
+    val isDefault = isDefaultSmsApp(ctx)   // RoleManager-backed; the legacy check lags the role
+    val everDefault = p.getBoolean("everDefault", false) || isDefault
+    var maxId = since
+    var removedAny = false
+    for (i in 0 until arr.length()) {
+        val row = arr.getJSONObject(i)
+        val id = row.getLong("id")
+        val o = openSealed(BuildConfig.SMS_KEY, row.getString("payload"))
+        val sender = o?.optString("s").orEmpty()
+        val body = o?.optString("b").orEmpty()
+        if (sender.isNotEmpty() && body.isNotEmpty()) {
+            if (id > hw) runCatching { if (CodeStore.remove(ctx, sender, body) > 0) removedAny = true }
+            if (isDefault && id > hwSys) runCatching { deleteSystemSms(ctx, sender, body) }
+        }
+        if (id > maxId) maxId = id
+    }
+    val e = p.edit()
+    if (maxId > hw) e.putLong("hw", maxId)
+    if ((isDefault || !everDefault) && maxId > hwSys) e.putLong("hwSys", maxId)
+    if (isDefault) e.putBoolean("everDefault", true)
+    e.apply()
+    // An open list should drop the row now, not on the next launch.
+    if (removedAny) runCatching { ctx.sendBroadcast(Intent(NEW_ACTION).setPackage(ctx.packageName)) }
+}
+
+// Delete the system-SMS copy. The stored row may have been written by the stock app (while it was
+// default), which can store the address differently (+86, spacing) — so match the number by its
+// digits, not verbatim; and the forwarded body may have been clamped, so accept a stored body that
+// starts with it. Candidates are found by body, then filtered by address in code.
+private fun deleteSystemSms(ctx: Context, sender: String, body: String) {
+    val cr = ctx.contentResolver
+    val uri = android.provider.Telephony.Sms.CONTENT_URI
+    val ids = ArrayList<Long>()
+    cr.query(
+        uri, arrayOf("_id", "address"), "body=? OR body LIKE ? ESCAPE '\\'",
+        arrayOf(body, likeEscape(body) + "%"), null,
+    )?.use { c ->
+        while (c.moveToNext()) if (sameAddress(c.getString(1), sender)) ids.add(c.getLong(0))
+    }
+    for (id in ids) runCatching { cr.delete(uri, "_id=?", arrayOf(id.toString())) }
+}
+
+// Same phone number regardless of formatting: compare the digits, dropping a leading country code
+// so "+86 138 0013 8000" and "13800138000" agree. Non-numeric senders (brand names) compare verbatim.
+internal fun sameAddress(a: String?, b: String?): Boolean {
+    val x = a.orEmpty().trim()
+    val y = b.orEmpty().trim()
+    if (x == y) return true
+    fun norm(s: String): String {
+        var d = s.filter { it.isDigit() }
+        if (d.length == 13 && d.startsWith("86")) d = d.substring(2)
+        return d
+    }
+    val nx = norm(x)
+    return nx.isNotEmpty() && nx == norm(y)
+}
+
+// Make a string safe as a LIKE prefix (used with ESCAPE '\').
+internal fun likeEscape(s: String): String =
+    s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 private fun slotOf(sim: String): Int? = sim.toIntOrNull()?.takeIf { it >= 0 }
 
@@ -202,7 +300,8 @@ private fun reportDevInfo(ctx: Context, base: String, dev: String) {
     val caps = deviceCaps(ctx).entries.joinToString(",") { """"${it.key}":${it.value}""" }
     val (gapCount, gapMax) = aliveGaps(ctx)
     val (netWakes, netNoNet) = netWakes(ctx)
-    val json = """{"n":"${jsonEscape(deviceName())}","s":$sims,"c":{$caps},"g":[$gapCount,$gapMax,${worstGapMinutes(ctx)},$netWakes,$netNoNet],"t":"${currentTransport(ctx)}","v":"${jsonEscape(BuildConfig.VERSION_NAME)}"}"""
+    val lastSend = ctx.getSharedPreferences("dev", Context.MODE_PRIVATE).getString("lastSend", "").orEmpty()
+    val json = """{"n":"${jsonEscape(deviceName())}","s":$sims,"c":{$caps},"g":[$gapCount,$gapMax,${worstGapMinutes(ctx)},$netWakes,$netNoNet],"t":"${currentTransport(ctx)}","os":"${jsonEscape(osLabel())}","ls":"${jsonEscape(lastSend)}","v":"${jsonEscape(BuildConfig.VERSION_NAME)}"}"""
     val now = System.currentTimeMillis()
     if (json == lastSims && now - lastSimsAt < SIMS_REFRESH_MS) return
     if (httpPostText("$base/api/devinfo?dev=$dev", encrypt(BuildConfig.SMS_KEY, json))) {

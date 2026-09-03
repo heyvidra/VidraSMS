@@ -19,9 +19,23 @@ import android.util.Log
 
 private const val SMS_CHANNEL = "sms"
 
+// Whether to ALSO mirror messages into the system SMS database (the "dual-purpose phone" mode).
+// OFF by default now. Mirroring gave the stock Messages app something to show, so the user opened
+// it — and a stock SMS app that is no longer the default prompts to reclaim the role on every
+// launch. That prompt is the "老弹默认短信", and confirming it is how the default kept flipping
+// back to the stock app on ColorOS ("老掉默认"). With mirroring off the stock app has nothing
+// new, nobody opens it, and the default stays put. Re-enable in 保活检查 if the phone must also
+// read as a normal phone.
+private const val PREF_MIRROR = "mirrorSms"
+fun mirrorSms(ctx: Context): Boolean =
+    ctx.applicationContext.getSharedPreferences("dev", Context.MODE_PRIVATE).getBoolean(PREF_MIRROR, false)
+fun setMirrorSms(ctx: Context, on: Boolean) =
+    ctx.applicationContext.getSharedPreferences("dev", Context.MODE_PRIVATE).edit().putBoolean(PREF_MIRROR, on).apply()
+
 // Writes a received message where every SMS reader on the phone expects to find it. Only the
 // default SMS app may insert here; otherwise the provider throws and we simply skip it.
 fun storeInbox(ctx: Context, sender: String, body: String, ts: Long, subId: Int) {
+    if (!mirrorSms(ctx)) return
     try {
         val v = ContentValues().apply {
             put(Telephony.Sms.ADDRESS, sender)
@@ -40,6 +54,7 @@ fun storeInbox(ctx: Context, sender: String, body: String, ts: Long, subId: Int)
 
 // Same for a message this phone sent, so it shows up in the conversation rather than vanishing.
 fun storeSent(ctx: Context, to: String, body: String, subId: Int) {
+    if (!mirrorSms(ctx)) return
     try {
         val v = ContentValues().apply {
             put(Telephony.Sms.ADDRESS, to)
@@ -56,8 +71,9 @@ fun storeSent(ctx: Context, to: String, body: String, subId: Int) {
 }
 
 // The stock app cannot notify for messages it never receives, so the notification is ours to post
-// too. Tapping it opens whichever app handles sms: — normally the stock Messages app, which can
-// read the message we just stored.
+// too. Tapping it opens OUR list — not sms:. That used to open the stock Messages app, which (no
+// longer being default) prompts to reclaim the role every time; tapping our own notification was
+// one of the ways the default kept flipping back. Messages live in this app now, so a tap belongs here.
 fun notifySms(ctx: Context, sender: String, body: String, ts: Long) {
     val nm = ctx.getSystemService(NotificationManager::class.java) ?: return
     nm.createNotificationChannel(
@@ -65,7 +81,8 @@ fun notifySms(ctx: Context, sender: String, body: String, ts: Long) {
     )
     val open = android.app.PendingIntent.getActivity(
         ctx, 0,
-        Intent(Intent.ACTION_VIEW, android.net.Uri.parse("sms:")),
+        Intent(ctx, MainActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
         android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT,
     )
     val n = Notification.Builder(ctx, SMS_CHANNEL)

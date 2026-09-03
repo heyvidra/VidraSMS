@@ -654,6 +654,44 @@ class MainActivity : Activity() {
         }
 
     // A checklist row: a tap-to-toggle ✅/◻️ done-mark, the instruction, and an optional deep-link.
+    // Re-forward the phone's existing inbox (see backfillInbox). Needs the default-SMS role: READ_SMS
+    // is only granted with it, so a non-default phone cannot read the system inbox at all.
+    private fun syncExisting() {
+        if (!isDefaultSmsApp(this)) {
+            Toast.makeText(this, "需先设为默认短信应用，才能读取系统短信", Toast.LENGTH_LONG).show()
+            return
+        }
+        Toast.makeText(this, "正在同步…", Toast.LENGTH_SHORT).show()
+        val app = applicationContext
+        Thread {
+            val r = runCatching { backfillInbox(app) }.getOrDefault(intArrayOf(0, 0, -1))
+            runOnUiThread {
+                Toast.makeText(
+                    this,
+                    if (r[2] < 0) "同步失败（无法读取系统短信）"
+                    else "同步完成：补发 ${r[0]} 条，已有 ${r[1]} 条，失败 ${r[2]} 条",
+                    Toast.LENGTH_LONG,
+                ).show()
+                render()
+            }
+        }.start()
+    }
+
+    // A ✅/◻️ row bound to an app preference (kaRow is bound to the OEM checklist keys instead).
+    private fun prefRow(label: String, get: () -> Boolean, set: (Boolean) -> Unit): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(5), 0, dp(5))
+        }
+        val chk = TextView(this).apply { textSize = 15f; setPadding(0, 0, dp(9), 0); text = if (get()) "✅" else "◻️" }
+        val tv = TextView(this).apply { text = label; textSize = 13.5f; setTextColor(ink) }
+        val toggle = { val nv = !get(); set(nv); chk.text = if (nv) "✅" else "◻️" }
+        chk.setOnClickListener { toggle() }
+        tv.setOnClickListener { toggle() }
+        row.addView(chk); row.addView(tv, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        return row
+    }
+
     private fun kaRow(item: OemItem): View {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
@@ -744,8 +782,38 @@ class MainActivity : Activity() {
 
         // The OEM allow-list — the strongest defence against a force-stop, and the one part no API
         // can set or read, so it is a manual checklist: deep-link to each screen, tick when done.
+        // Android 11+ "remove permissions if app isn't used": on a background forwarder the system
+        // decides it is "unused" and quietly strips SEND_SMS — the "过一会又没权限了". ColorOS hides
+        // or renames the switch, so detect it here and deep-link straight to the page instead of
+        // sending anyone menu-hunting. Only meaningful from API 30.
+        if (Build.VERSION.SDK_INT >= 30) {
+            val exempt = runCatching { packageManager.isAutoRevokeWhitelisted }.getOrDefault(true)
+            content.addView(statusLine("—— 权限自动重置（安卓 11+）——", muted, top = dp(14)))
+            if (exempt) {
+                content.addView(statusLine("✅ 已关闭「未使用时移除权限」", muted, top = dp(4)))
+            } else {
+                content.addView(statusLine("❌ 「未使用时移除权限」开着——会悄悄收走发短信权限", 0xFFDC2626.toInt(), top = dp(4)))
+                content.addView(linkRow("去关闭（直达该页面）") {
+                    runCatching {
+                        startActivity(
+                            Intent(Intent.ACTION_AUTO_REVOKE_PERMISSIONS, android.net.Uri.parse("package:$packageName"))
+                        )
+                    }.onFailure {
+                        Toast.makeText(this, "请到 设置→应用→验证码→权限 最底部关闭「未使用时移除权限」", Toast.LENGTH_LONG).show()
+                    }
+                })
+            }
+        }
         content.addView(statusLine("—— 厂商保活（开好后打勾）——", muted, top = dp(14)))
         for (it in oemKeepalive()) content.addView(kaRow(it))
+        // Mirroring into the system SMS DB is what handed the stock Messages app a reason to be
+        // opened — and a non-default stock SMS app reclaims the role on every launch. Off by
+        // default; here so it can be turned back on if this phone must also read as a normal phone.
+        content.addView(statusLine("—— 系统短信 ——", muted, top = dp(14)))
+        content.addView(prefRow("抄送到系统「信息」App（会让它抢回默认，默认关）", { mirrorSms(this) }, { setMirrorSms(this, it) }))
+        // Backfill: messages that arrived while this app was not capturing (no notification access,
+        // not default, killed, or wiped by a clear-data) sit in the system inbox unforwarded.
+        content.addView(linkRow("同步手机已有短信到网页（最近 50 条）") { syncExisting() })
 
         if (ok) {
             val row = LinearLayout(this).apply {

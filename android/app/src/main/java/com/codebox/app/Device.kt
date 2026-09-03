@@ -37,6 +37,47 @@ fun deviceName(): String {
     }
 }
 
+// OS label for the web card: "Android 11 · ColorOS V11.1" — Android from Build, ColorOS from a
+// system property (best-effort, names vary across OPLUS/OPPO builds; falls back to just Android).
+// Lets remote diagnosis read the ROM off the dashboard instead of asking someone to check on-device.
+fun osLabel(): String {
+    val android = "Android " + (Build.VERSION.RELEASE ?: Build.VERSION.SDK_INT.toString())
+    // The ROM name comes FROM whichever vendor property matched — NOT hardcoded — so a Xiaomi reads
+    // "MIUI", a vivo "OriginOS", a Huawei "EMUI", never a wrong "ColorOS". Empty name = the property
+    // value already carries its own (EMUI). Unknown vendor / no property → just the Android version.
+    val roms = listOf(
+        "ColorOS" to "ro.build.version.oplusrom",
+        "ColorOS" to "ro.build.version.opporom",
+        "MIUI" to "ro.miui.ui.version.name",
+        "OriginOS" to "ro.vivo.os.version",
+        "" to "ro.build.version.emui",
+        "" to "ro.rom.version",
+    )
+    val rom = runCatching {
+        val sp = Class.forName("android.os.SystemProperties")
+        val get = sp.getMethod("get", String::class.java)
+        var found: String? = null
+        for ((name, prop) in roms) {
+            val v = (get.invoke(null, prop) as? String).orEmpty().trim()
+            if (v.isNotBlank()) { found = if (name.isBlank()) v else "$name $v"; break }
+        }
+        found
+    }.getOrNull()
+    return if (!rom.isNullOrBlank()) "$android · $rom" else android
+}
+
+// Whether this app is the default SMS app. RoleManager on 29+: the legacy
+// Telephony.Sms.getDefaultSmsPackage() can lag or disagree with the role (seen on an emulator where
+// the role was held but the legacy setting was still null), and it is the ROLE that actually gates
+// writing to / deleting from the SMS provider. Same rule deviceCaps() uses.
+fun isDefaultSmsApp(ctx: Context): Boolean = runCatching {
+    val app = ctx.applicationContext
+    if (Build.VERSION.SDK_INT >= 29)
+        app.getSystemService(android.app.role.RoleManager::class.java)
+            ?.isRoleHeld(android.app.role.RoleManager.ROLE_SMS) == true
+    else android.provider.Telephony.Sms.getDefaultSmsPackage(app) == app.packageName
+}.getOrDefault(false)
+
 // What this phone can actually still do, reported with the SIM list so the web can say so.
 // Without it a lost permission is invisible from the browser: notification access can be revoked
 // by a ROM update or "clear data", and missed-call capture then stops silently while SMS keeps

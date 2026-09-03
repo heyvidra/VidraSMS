@@ -51,3 +51,13 @@ CREATE TABLE IF NOT EXISTS devices (
   ts   INTEGER NOT NULL,
   info TEXT
 );
+
+-- Web deletes that must be mirrored onto the phones. When a message is deleted on the web, its
+-- encrypted body is copied here; each phone reads rows past its stored high-water mark on the next
+-- poll, decrypts, and deletes the matching SMS from the system SMS database (only the default-SMS
+-- app phone actually holds a copy). Broadcast to all phones; pruned after a week by scheduled().
+CREATE TABLE IF NOT EXISTS deletions (
+  id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts      INTEGER NOT NULL,
+  payload TEXT    NOT NULL   -- the deleted message's encrypted body (v1:...)
+);

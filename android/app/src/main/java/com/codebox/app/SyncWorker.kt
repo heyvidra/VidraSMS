@@ -236,18 +236,21 @@ fun configured(): Boolean =
 // both agree on what counts as permanent. Sender travels inside the ciphertext (no Title header),
 // so the server sees only that something arrived, not who texted.
 fun uploadMessage(ctx: Context, sender: String, body: String, ts: Long, sim: String?,
-                  timeoutMs: Int = PATIENT_MS): Outcome {
+                  timeoutMs: Int = PATIENT_MS, quiet: Boolean = false): Outcome {
     val payload = sealMessage(
         BuildConfig.SMS_KEY, sender, formatBody(body, ts, System.currentTimeMillis()), sim,
         deviceId(ctx),
     )
+    // quiet = a backfill of the phone's existing inbox: the server stores it with its ORIGINAL
+    // time and skips the push, so re-forwarding 50 old messages doesn't ring 50 notifications.
+    val extra = if (quiet) "&quiet=1&ts=$ts" else ""
     for (base in bases()) {
         // dev in the clear (same opaque id already sent to /api/outbox & /api/devinfo) so the
         // server can bump this phone's heartbeat on every forward. A ColorOS-frozen phone stops
         // polling but still forwards via the SMS broadcast — without this it reads "offline" while
         // it is in fact delivering, which is exactly the false alarm that looked like a failure.
         val code = postForward(
-            "$base/${BuildConfig.NTFY_TOPIC}?dev=${deviceId(ctx)}", payload, timeoutMs)
+            "$base/${BuildConfig.NTFY_TOPIC}?dev=${deviceId(ctx)}$extra", payload, timeoutMs)
         when {
             code < 0 -> continue                          // this base unreachable → next door
             outcomeFor(code) == Outcome.SUCCESS -> return Outcome.SUCCESS
@@ -256,6 +259,36 @@ fun uploadMessage(ctx: Context, sender: String, body: String, ts: Long, sim: Str
         }
     }
     return Outcome.RETRY   // all blocked or all 5xx
+}
+
+// Re-forward the phone's existing inbox (newest 50) — the messages this app never captured: they
+// arrived while it had no notification access, wasn't default, was killed, or after a clear-data
+// wiped its own store. Each is recorded locally first (recordIncoming dedups, so already-known
+// ones are skipped), then sent quiet with its original time. Returns [sent, skipped, failed].
+// The caller must hold the default-SMS role — READ_SMS is only granted with it; without it the
+// query throws and the caller reports "无法读取".
+fun backfillInbox(ctx: Context): IntArray {
+    val app = ctx.applicationContext
+    var sent = 0
+    var skipped = 0
+    var failed = 0
+    app.contentResolver.query(
+        android.provider.Telephony.Sms.Inbox.CONTENT_URI,
+        arrayOf("address", "body", "date"), null, null, "date DESC LIMIT 50",
+    )?.use { c ->
+        while (c.moveToNext()) {
+            val sender = c.getString(0).orEmpty()
+            val body = c.getString(1).orEmpty()
+            val ts = c.getLong(2)
+            if (sender.isBlank() || body.isBlank()) continue
+            if (!recordIncoming(app, sender, body, ts)) { skipped++; continue }
+            val r = runCatching {
+                uploadMessage(app, sender, clampBody(body, MAX_PLAIN_BYTES), ts, null, QUICK_MS, quiet = true)
+            }.getOrDefault(Outcome.RETRY)
+            if (r == Outcome.SUCCESS) sent++ else failed++
+        }
+    }
+    return intArrayOf(sent, skipped, failed)
 }
 
 // POSTs the payload to one endpoint. Returns the HTTP status, or -1 on a network/TLS failure

@@ -59,6 +59,14 @@ object CodeStore {
         return true
     }
 
+    // Mirror of a web-side delete: drop our own copy so the in-app list stops showing it. Exact
+    // body, or a stored body that STARTS with it — the forwarded copy may have been clamped.
+    fun remove(ctx: Context, sender: String, body: String): Int =
+        db(ctx).delete(
+            "msg", "sender=? AND (body=? OR body LIKE ? ESCAPE '\\')",
+            arrayOf(sender, body, likeEscape(body) + "%"),
+        )
+
     fun recent(ctx: Context): List<Msg> {
         val out = ArrayList<Msg>()
         db(ctx).rawQuery("SELECT id, ts, sender, body FROM msg ORDER BY id DESC LIMIT $CAP", null).use { c ->

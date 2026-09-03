@@ -106,6 +106,7 @@ async function pushAll(env) {
         method: "POST",
         headers: { Authorization: `vapid t=${jwt}, k=${env.VAPID_PUBLIC}`, TTL: "600" },
       });
+      console.log("push", res.status, new URL(row.endpoint).host, (await res.clone().text().catch(() => "")).slice(0, 200));
       // A gone subscription (uninstalled PWA, expired) must be pruned or it errors forever.
       if (res.status === 404 || res.status === 410) {
         await env.DB.prepare("DELETE FROM subs WHERE endpoint = ?").bind(row.endpoint).run();
@@ -143,15 +144,23 @@ async function handlePublish(request, env, topic, ctx) {
   const body = await request.text();
   if (!body) return new Response("empty body", { status: 400 });
 
+  // A backfill (the app re-forwarding the phone's existing inbox) arrives with quiet=1 and the
+  // message's ORIGINAL time: stored like any other row, but no push — 50 old messages must not
+  // become 50 notifications — and timestamped when it really arrived, not when it was re-sent.
+  const u = new URL(request.url);
+  const quiet = u.searchParams.get("quiet") === "1";
+  const tsParam = Number(u.searchParams.get("ts") || 0);
+  const ts = (quiet && tsParam > 1e12 && tsParam <= Date.now() + 60_000) ? tsParam : Date.now();
+
   await env.DB.prepare("INSERT INTO messages (ts, sender, body) VALUES (?, ?, ?)")
-    .bind(Date.now(), decodeTitle(request.headers.get("Title")), body)
+    .bind(ts, decodeTitle(request.headers.get("Title")), body)
     .run();
 
   // A forward IS a heartbeat: on ColorOS/EMUI the phone's poll can be frozen while the SMS
   // broadcast still wakes it to deliver, so keying "online" only on the poll made an actively-
   // forwarding phone read offline. Bump its heartbeat here too. dev is the same opaque id the
   // poll already sends; ON CONFLICT so it works before the first devinfo creates the row.
-  const dev = (new URL(request.url).searchParams.get("dev") || "").slice(0, 64);
+  const dev = (u.searchParams.get("dev") || "").slice(0, 64);
   if (dev) {
     ctx?.waitUntil(env.DB.prepare(
       "INSERT INTO devices (id, ts) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET ts=excluded.ts"
@@ -159,7 +168,7 @@ async function handlePublish(request, env, topic, ctx) {
   }
 
   // Notify subscribed PWAs after responding, so the phone's 200 isn't held up by push.
-  ctx?.waitUntil(pushAll(env));
+  if (!quiet) ctx?.waitUntil(pushAll(env));
   return new Response("ok", { status: 200 });
 }
 
@@ -177,8 +186,18 @@ async function handleList(request, env) {
 
 // DELETE /api/messages/<id>, or /api/messages/all to wipe everything.
 async function handleDelete(env, rest) {
+  // A web delete also removes the message from the phone's own SMS database. We can't do that from
+  // the server (E2E: the number/body are only inside the encrypted blob, and only the default-SMS
+  // phone can delete from the provider), so we copy the encrypted body into `deletions`; each phone
+  // reads new rows on its next poll, decrypts, and deletes the matching SMS locally. Broadcast: any
+  // phone with a copy deletes it, the rest find no match. Rows are pruned after a week (scheduled()).
+  const now = Date.now();
   if (rest === "all") {
-    await env.DB.prepare("DELETE FROM messages").run();
+    const rows = await env.DB.prepare("SELECT body FROM messages").all();
+    const stmts = (rows.results || []).map((r) =>
+      env.DB.prepare("INSERT INTO deletions (ts, payload) VALUES (?, ?)").bind(now, r.body));
+    stmts.push(env.DB.prepare("DELETE FROM messages"));
+    await env.DB.batch(stmts);
     return Response.json({ ok: true, all: true });
   }
   const id = Number(rest);
@@ -188,8 +207,14 @@ async function handleDelete(env, rest) {
       headers: { "Content-Type": "application/json" },
     });
   }
-  const r = await env.DB.prepare("DELETE FROM messages WHERE id = ?").bind(id).run();
-  return Response.json({ ok: true, deleted: r.meta?.changes ?? 0 });
+  const msg = await env.DB.prepare("SELECT body FROM messages WHERE id = ?").bind(id).first();
+  if (msg) {
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO deletions (ts, payload) VALUES (?, ?)").bind(now, msg.body),
+      env.DB.prepare("DELETE FROM messages WHERE id = ?").bind(id),
+    ]);
+  }
+  return Response.json({ ok: true, deleted: msg ? 1 : 0 });
 }
 
 async function handleLogin(request, env) {
@@ -270,6 +295,26 @@ export default {
       await env.DB.prepare("INSERT OR REPLACE INTO subs (endpoint, p256dh, auth) VALUES (?, ?, ?)")
         .bind(sub.endpoint, sub.keys?.p256dh || "", sub.keys?.auth || "").run();
       return Response.json({ ok: true });
+    }
+
+    if (request.method === "POST" && path === "/api/unsubscribe") {
+      if (!(await sessionValid(request, env))) {
+        return new Response('{"error":"unauthorized"}', { status: 401, headers: { "Content-Type": "application/json" } });
+      }
+      const b = await request.json().catch(() => null);
+      if (b?.endpoint) await env.DB.prepare("DELETE FROM subs WHERE endpoint = ?").bind(String(b.endpoint)).run();
+      return Response.json({ ok: true });
+    }
+
+    // Fire a test push to every current subscription, so the user can verify push works without
+    // waiting for a real SMS. pushAll also prunes any endpoint the push service reports as gone.
+    if (request.method === "POST" && path === "/api/testpush") {
+      if (!(await sessionValid(request, env))) {
+        return new Response('{"error":"unauthorized"}', { status: 401, headers: { "Content-Type": "application/json" } });
+      }
+      const c = await env.DB.prepare("SELECT count(*) AS n FROM subs").first();
+      await pushAll(env);
+      return Response.json({ ok: true, subs: c?.n || 0 });
     }
 
     // --- outbound SMS queue ---------------------------------------------------------
@@ -462,6 +507,20 @@ export default {
       });
     }
 
+    // Deletions the phone must mirror into its own SMS database. The phone reads rows past the
+    // high-water mark it stored, decrypts each payload, and deletes the matching local SMS.
+    if (path === "/api/deletions") {
+      const auth = request.headers.get("Authorization") || "";
+      if (!env.SEND_TOKEN || !auth.startsWith("Bearer ") || !safeEqual(auth.slice(7), env.SEND_TOKEN)) {
+        return new Response('{"error":"unauthorized"}', { status: 401, headers: { "Content-Type": "application/json" } });
+      }
+      const since = Number(new URL(request.url).searchParams.get("since") || "0") || 0;
+      const rows = await env.DB.prepare(
+        "SELECT id, payload FROM deletions WHERE id > ? ORDER BY id LIMIT 500"
+      ).bind(since).all();
+      return Response.json(rows.results || []);
+    }
+
     // APK download, gated by a short code (not the full login). The APK embeds NTFY_TOKEN
     // and SMS_KEY, so this stops a random URL-guesser from grabbing it. Handled before the
     // publish catch-all so POST /app isn't mistaken for a phone upload. The code is checked
@@ -549,6 +608,15 @@ export default {
   // stored ciphertext into the outbox; the phone's normal ~20s poll drains it. No-op unless the
   // web switch enabled it and the chosen time has passed.
   async scheduled(event, env, ctx) {
+    // Prune deletion rows older than a week — every phone polling within that window has seen them.
+    await env.DB.prepare("DELETE FROM deletions WHERE ts < ?").bind(Date.now() - 7 * 86_400_000).run();
+    // Backstop for stuck sends: the poll-path only fails a row out when a phone actually polls, so
+    // a phone that goes offline mid-send leaves its row "发送中" forever. Fail any send still
+    // sending well past the claim window (20-min grace lets a briefly-offline phone resume first).
+    await env.DB.prepare(
+      "UPDATE outbox SET status='failed', detail='发送未完成（手机离线/被杀），已超时' " +
+      "WHERE status='sending' AND ts <= ?"
+    ).bind(Date.now() - 20 * 60_000).run();
     const row = await env.DB.prepare("SELECT v FROM meta WHERE k='keepalive'").first();
     if (!row) return;
     let k; try { k = JSON.parse(row.v); } catch { return; }
@@ -680,21 +748,134 @@ const apkGatePage = (error = "") => `<!doctype html>
 // Service worker: shows a generic notification on push (server has no plaintext), and
 // focuses the PWA on click.
 const SW = `
+// Activate a new SW version immediately — otherwise a fix sits waiting until every window is
+// closed, and iOS keeps running the old handler.
+self.addEventListener("install", () => self.skipWaiting());
+self.addEventListener("activate", (e) => e.waitUntil(clients.claim()));
+
+// --- tiny IndexedDB kv. A service worker cannot read localStorage, so the page mirrors the E2E
+// key here (and only the key); the SW keeps its own read cursor (lastId) here too.
+function idb(){ return new Promise((res, rej) => { const r = indexedDB.open("sms-sw", 1); r.onupgradeneeded = () => r.result.createObjectStore("kv"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); }
+async function kvGet(k){ try { const db = await idb(); return await new Promise((res) => { const t = db.transaction("kv").objectStore("kv").get(k); t.onsuccess = () => res(t.result); t.onerror = () => res(undefined); }); } catch { return undefined; } }
+async function kvPut(k, v){ try { const db = await idb(); await new Promise((res) => { const t = db.transaction("kv", "readwrite"); t.objectStore("kv").put(v, k); t.oncomplete = () => res(); t.onerror = () => res(); }); } catch {} }
+
+// --- decrypt: the same v1: AES-GCM blob the page opens. Done HERE, on the device, so the push
+// can show real content while the server still only ever holds ciphertext.
+function hexToBytes(h){ const o = new Uint8Array(h.length / 2); for (let i = 0; i < o.length; i++) o[i] = parseInt(h.substr(i * 2, 2), 16); return o; }
+async function openMsg(msg, key){
+  if (!String(msg.body || "").startsWith("v1:")) return { sender: msg.sender, body: msg.body };
+  if (!key) return null;
+  try {
+    const raw = Uint8Array.from(atob(msg.body.slice(3)), (c) => c.charCodeAt(0));
+    const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: raw.slice(0, 12) }, key, raw.slice(12));
+    const o = JSON.parse(new TextDecoder().decode(pt));
+    return { sender: o.s, body: o.b };
+  } catch { return null; }
+}
+
+// --- 号码归属地: same table + lookup as the page; the number never leaves the device.
+let PLDB = null, AREA = null;
+const CARD_NAME = { 1: "移动", 2: "联通", 3: "电信", 4: "电信虚拟", 5: "联通虚拟", 6: "移动虚拟", 7: "广电" };
+function parsePL(bytes){
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]) !== "PL01") throw new Error("bad magic");
+  let p = 4;
+  const varint = () => { let v = 0, s = 1; for(;;){ const b = bytes[p++]; v += (b & 127) * s; if (!(b & 128)) break; s *= 128; } return v; };
+  const recCount = dv.getUint16(p, true); p += 2;
+  const dec = new TextDecoder();
+  const records = new Array(recCount);
+  for (let i = 0; i < recCount; i++){ const n = varint(); records[i] = dec.decode(bytes.subarray(p, p + n)); p += n; }
+  const runCount = dv.getUint32(p, true); p += 4;
+  const starts = new Int32Array(runCount), lens = new Int32Array(runCount), recs = new Int32Array(runCount), cards = new Uint8Array(runCount);
+  let prev = 0;
+  for (let i = 0; i < runCount; i++){ prev += varint(); starts[i] = prev; lens[i] = varint(); recs[i] = varint(); cards[i] = bytes[p++]; }
+  return { records, starts, lens, recs, cards };
+}
+async function loadPL(){
+  if (PLDB) return PLDB;
+  try {
+    const r = await fetch("/pl.bin", { cache: "force-cache" });
+    if (!r.ok) return null;
+    let bytes = new Uint8Array(await r.arrayBuffer());
+    if (bytes[0] === 0x1f && bytes[1] === 0x8b) {
+      const ds = new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip")));
+      bytes = new Uint8Array(await ds.arrayBuffer());
+    }
+    PLDB = parsePL(bytes);
+    AREA = new Map();
+    for (const rec of PLDB.records){ const f = rec.split("|"); if (f[3] && !AREA.has(f[3])) AREA.set(f[3], f[1] || f[0]); }
+  } catch { return null; }
+  return PLDB;
+}
+function plLookup(prefix){
+  const s = PLDB.starts; let lo = 0, hi = s.length - 1, hit = -1;
+  while (lo <= hi){ const mid = (lo + hi) >> 1; if (s[mid] <= prefix){ hit = mid; lo = mid + 1; } else hi = mid - 1; }
+  if (hit < 0 || prefix >= s[hit] + PLDB.lens[hit]) return null;
+  return { rec: PLDB.records[PLDB.recs[hit]], card: PLDB.cards[hit] };
+}
+function locOf(raw){
+  if (!PLDB) return "";
+  let d = String(raw || "").replace(/[^0-9]/g, "");
+  if (d.length === 13 && d.slice(0, 2) === "86") d = d.slice(2);
+  if (d.length >= 11 && d[0] === "1"){
+    const hit = plLookup(Number(d.slice(0, 7))); if (!hit) return "";
+    const f = hit.rec.split("|"); return (f[1] || f[0]) + " · " + (CARD_NAME[hit.card] || "");
+  }
+  if (d[0] === "0" && AREA) return AREA.get(d.slice(0, 4)) || AREA.get(d.slice(0, 3)) || "";
+  return "";
+}
+
+// --- what to show for one decrypted message
+//   未接来电  → "📞 未接来电"  /  号码 · 归属地
+//   验证码    → 平台(【xx】或发件人) / 验证码 123456
+//   其他      → 新消息 / 点击查看
+const CODE_RE = /(^|[^0-9.])([0-9]{4,8})(?![0-9.])/;
+function notifFor(m){
+  const sender = String(m.sender || ""), body = String(m.body || "");
+  if (body === "未接来电") {
+    const loc = locOf(sender);
+    return { title: "📞 未接来电", body: sender + (loc ? " · " + loc : "") };
+  }
+  const cm = CODE_RE.exec(body);
+  if (cm) {
+    const bm = /【([^】]{1,20})】/.exec(body);
+    return { title: bm ? bm[1] : sender, body: "验证码 " + cm[2] };
+  }
+  return { title: "新消息", body: "点击查看" };
+}
+
 self.addEventListener("push", (e) => {
   e.waitUntil((async () => {
     const cls = await clients.matchAll({ type: "window", includeUncontrolled: true });
-    // If a page is on screen it decrypts and shows the message itself — so just poke it to refetch
-    // now (killing the up-to-10s poll lag) and DON'T stack the generic push notification on top.
-    // That double — a content-less "新验证码" first, then the real one when the row finally polled
-    // in — was the two-notifications-per-message the user saw. Only notify from here when nothing
-    // is visible to do it (app closed, or iOS PWA suspended in the background).
-    if (cls.some((c) => c.visibilityState === "visible")) {
-      for (const c of cls) c.postMessage({ type: "sms" });
-      return;
-    }
-    await self.registration.showNotification("新验证码", {
-      body: "点击查看", tag: "sms", icon: "/icon-192.png", badge: "/icon-192.png"
-    });
+    for (const c of cls) c.postMessage({ type: "sms" });   // an open page refetches at once
+    const opts = { icon: "/icon-192.png", badge: "/icon-192.png" };
+    let shown = 0;
+    try {
+      const hex = await kvGet("sms_key");
+      const key = (typeof hex === "string" && /^[0-9a-f]{64}$/i.test(hex))
+        ? await crypto.subtle.importKey("raw", hexToBytes(hex), "AES-GCM", false, ["decrypt"]) : null;
+      const last = await kvGet("lastId");
+      const r = await fetch("/api/messages?since=" + (last || 0), { credentials: "same-origin", cache: "no-store" });
+      if (r.ok) {
+        let rows = await r.json();                 // newest first
+        if (!Array.isArray(rows)) rows = [];
+        // First run has no cursor: show only the newest, or a fresh install fires one per stored row.
+        if (!last && rows.length) rows = [rows[0]];
+        rows.reverse();                            // oldest → newest so they read in order
+        await loadPL().catch(() => null);
+        let maxId = last || 0;
+        for (const row of rows) {
+          const m = await openMsg(row, key);
+          const n = m ? notifFor(m) : { title: "新消息", body: "点击查看" };
+          await self.registration.showNotification(n.title, Object.assign({ body: n.body, tag: "m" + row.id }, opts));
+          shown++;
+          if (row.id > maxId) maxId = row.id;
+        }
+        if (maxId !== (last || 0)) await kvPut("lastId", maxId);
+      }
+    } catch {}
+    // ALWAYS show something: iOS revokes a subscription that gets a push with no notification.
+    if (!shown) await self.registration.showNotification("新消息", Object.assign({ body: "点击查看", tag: "sms" }, opts));
   })());
 });
 self.addEventListener("notificationclick", (e) => {
@@ -906,6 +1087,7 @@ const PAGE = `<!doctype html>
 
 <div id="moreMenu" class="menu" hidden role="menu">
   <button class="mitem" id="notifyBtn" type="button" role="menuitem"><span>通知</span><span class="chk" hidden>✓</span></button>
+  <button class="mitem" id="testPushBtn" type="button" role="menuitem"><span>测试推送</span></button>
   <button class="mitem" id="keyBtn" type="button" role="menuitem">密钥</button>
   <button class="mitem" id="kaBtn" type="button" role="menuitem">定时保号</button>
   <a class="mitem danger" href="/logout" role="menuitem">退出</a>
@@ -1054,8 +1236,23 @@ let cryptoKey = null;
 
 const hexToBytes = (h) => Uint8Array.from(h.match(/../g).map((b) => parseInt(b, 16)));
 
+// The service worker cannot read localStorage, so the E2E key (and only the key) is mirrored
+// into a tiny IndexedDB store it can reach — that is what lets a push be decrypted on-device and
+// shown with real content (未接来电 / 验证码) instead of a bare "点击查看".
+function swKvPut(k, v){
+  return new Promise((res) => {
+    try {
+      const r = indexedDB.open("sms-sw", 1);
+      r.onupgradeneeded = () => r.result.createObjectStore("kv");
+      r.onsuccess = () => { const t = r.result.transaction("kv", "readwrite"); t.objectStore("kv").put(v, k); t.oncomplete = () => res(); t.onerror = () => res(); };
+      r.onerror = () => res();
+    } catch { res(); }
+  });
+}
+
 async function loadKey(){
   const hex = localStorage.getItem("sms_key") || "";
+  swKvPut("sms_key", /^[0-9a-f]{64}$/i.test(hex) ? hex : "").catch(() => {});
   if (!/^[0-9a-f]{64}$/i.test(hex)) { cryptoKey = null; return; }
   cryptoKey = await crypto.subtle.importKey("raw", hexToBytes(hex), "AES-GCM", false, ["encrypt", "decrypt"]);
 }
@@ -1229,8 +1426,14 @@ async function enablePush(){
     const reg = await navigator.serviceWorker.register("/sw.js");
     await navigator.serviceWorker.ready;
     const key = (await (await fetch("/api/vapid")).text()).trim();
-    const sub = await reg.pushManager.getSubscription()
-      || await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: u8FromB64u(key) });
+    // Always start from a FRESH endpoint. Reusing getSubscription() hands back a subscription
+    // Apple may already have revoked, so "re-enable" silently re-saved the same dead one.
+    const old = await reg.pushManager.getSubscription();
+    if (old) {
+      try { await fetch("/api/unsubscribe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ endpoint: old.endpoint }) }); } catch {}
+      try { await old.unsubscribe(); } catch {}
+    }
+    const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: u8FromB64u(key) });
     const r = await fetch("/api/subscribe", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(sub),
     });
@@ -1241,6 +1444,16 @@ async function enablePush(){
   paintNotifyBtn();
 }
 notifyBtn.onclick = enablePush;
+const testPushBtn = document.getElementById("testPushBtn");
+testPushBtn.onclick = async () => {
+  try {
+    const r = await fetch("/api/testpush", { method: "POST" });
+    if (!r.ok) { alert("测试推送失败（未登录？）"); return; }
+    const j = await r.json().catch(() => ({}));
+    if (!j.subs) { alert("当前没有推送订阅——请先在「通知」里开启并允许通知。"); return; }
+    alert("已向 " + j.subs + " 个订阅发送测试推送。几秒内应收到通知；没收到就是订阅/设备端问题，把「通知」关掉再打开重订阅。");
+  } catch { alert("测试推送出错，请重试。"); }
+};
 paintNotifyBtn();
 
 /* --- phone liveness --- */
@@ -1315,7 +1528,7 @@ async function renderBeat(){
     if (d.info && cryptoKey) { try { info = await openSend(d.info); } catch {} }
     next.set(d.id, {
       id: d.id, ts: d.ts, name: info?.n || ("设备 " + d.id.slice(0, 4)),
-      sims: info?.s || [], caps: info?.c || null, gaps: info?.g || null, ver: info?.v || null, tr: info?.t || null,
+      sims: info?.s || [], caps: info?.c || null, gaps: info?.g || null, ver: info?.v || null, tr: info?.t || null, os: info?.os || null, ls: info?.ls || null,
     });
   }
   DEVS = next;
@@ -1330,7 +1543,7 @@ async function renderBeat(){
     empty: devs.length ? 0 : (data.beat || 0),
     devs: [...next.values()].map((d) => {
       const on = nowB - d.ts < ONLINE_MS;
-      return [d.id, on, d.name, d.caps, d.gaps, d.sims, d.ver, d.tr, on ? 0 : ago(nowB - d.ts)];
+      return [d.id, on, d.name, d.caps, d.gaps, d.sims, d.ver, d.tr, d.os, d.ls, on ? 0 : ago(nowB - d.ts)];
     }),
   });
   if (sig === lastBeatSig) return;
@@ -1464,6 +1677,23 @@ async function renderBeat(){
       const net = document.createElement("div"); net.className = "dev-warn";
       net.textContent = "⚠ 熄屏唤醒 " + d.gaps[3] + " 次里 " + d.gaps[4] + " 次无网络·像是熄屏断网";
       sub.append(net);
+    }
+    // System version (Android + ColorOS/…): reported by the phone so the ROM is visible from here
+    // — needed to tell a device what its exact keep-alive/permission settings paths are.
+    if (d.os) {
+      const o = document.createElement("div"); o.className = "dev-sims";
+      o.textContent = String(d.os);
+      sub.append(o);
+    }
+    // Last send outcome the phone reported — the REAL per-attempt reason (无服务/结果码/权限…),
+    // visible even when the outbox row only shows the server's generic "多次尝试未送达".
+    if (d.ls) {
+      const fail = String(d.ls).startsWith("失败");
+      const l = document.createElement("div");
+      l.className = fail ? "dev-warn" : "dev-sims";
+      l.textContent = "上次发送 " + d.ls;
+      l.title = l.textContent;
+      sub.append(l);
     }
     // One line per SIM rather than "a / b": on a dual-SIM phone joining them just pushed the
     // second card past the ellipsis, which is exactly the one you needed to see.
