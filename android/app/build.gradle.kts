@@ -36,8 +36,8 @@ android {
         // Bump BOTH on every build so a phone's version is unambiguous — it rides up to the web
         // device card via BuildConfig.VERSION_NAME. versionCode must strictly increase for an
         // in-place update to install; versionName is what a human reads.
-        versionCode = 23
-        versionName = "2.6"
+        versionCode = 24
+        versionName = "2.7"
 
         buildConfigField("String", "NTFY_URL", quote(cfg("NTFY_URL")))
         buildConfigField("String", "NTFY_TOPIC", quote(cfg("NTFY_TOPIC")))

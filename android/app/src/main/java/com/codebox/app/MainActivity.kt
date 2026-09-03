@@ -226,7 +226,14 @@ class MainActivity : Activity() {
         // Opening the app is a good moment to check for a new version — do it off the main thread
         // (network) and re-render if one appeared, so the "发现新版本" banner shows without waiting
         // for the background cycle.
-        Thread { if (Updater.checkOnOpen(applicationContext)) runOnUiThread { render() } }.start()
+        // checkOnOpen is true only when the "update available" STATE changed — so the dialog pops
+        // once, on discovery, not on every open. Later opens keep the banner as the passive reminder.
+        Thread {
+            if (Updater.checkOnOpen(applicationContext)) runOnUiThread {
+                render()
+                if (Updater.updateAvailable(this)) showUpdateDialog(Updater.latestName(this))
+            }
+        }.start()
         val filter = IntentFilter(NEW_ACTION)
         // Our own broadcast, so NOT_EXPORTED is correct (and forwardNow sets the package).
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(newArrived, filter, Context.RECEIVER_NOT_EXPORTED)
@@ -509,6 +516,17 @@ class MainActivity : Activity() {
 
     // Explicit "check for updates" — hits the server now (no waiting on the 6h cycle), with a toast
     // for each outcome. On finding a newer build the banner appears via render().
+    // The "new version" prompt as a dialog (was a toast + banner): one tap to update, or 稍后.
+    private fun showUpdateDialog(name: String) {
+        if (isFinishing || isDestroyed) return
+        AlertDialog.Builder(this)
+            .setTitle("发现新版本 v$name")
+            .setMessage("当前 v${BuildConfig.VERSION_NAME}。现在下载并安装？")
+            .setPositiveButton("更新") { _, _ -> Updater.downloadAndInstall(this) }
+            .setNegativeButton("稍后", null)
+            .show()
+    }
+
     private fun checkForUpdate() {
         Toast.makeText(this, "正在检查更新…", Toast.LENGTH_SHORT).show()
         Thread {
@@ -518,7 +536,7 @@ class MainActivity : Activity() {
                     code == null -> Toast.makeText(this, "检查失败，请稍后重试", Toast.LENGTH_SHORT).show()
                     code > BuildConfig.VERSION_CODE -> {
                         render()
-                        Toast.makeText(this, "发现新版本 v" + Updater.latestName(this), Toast.LENGTH_SHORT).show()
+                        showUpdateDialog(Updater.latestName(this))
                     }
                     else -> Toast.makeText(this, "已是最新版本（v" + BuildConfig.VERSION_NAME + "）", Toast.LENGTH_SHORT).show()
                 }
