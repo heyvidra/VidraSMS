@@ -36,8 +36,8 @@ android {
         // Bump BOTH on every build so a phone's version is unambiguous — it rides up to the web
         // device card via BuildConfig.VERSION_NAME. versionCode must strictly increase for an
         // in-place update to install; versionName is what a human reads.
-        versionCode = 24
-        versionName = "2.7"
+        versionCode = 25
+        versionName = "2.8"
 
         buildConfigField("String", "NTFY_URL", quote(cfg("NTFY_URL")))
         buildConfigField("String", "NTFY_TOPIC", quote(cfg("NTFY_TOPIC")))
@@ -64,6 +64,14 @@ android {
     }
 
     buildFeatures { buildConfig = true }
+
+    // This is a phone-only personal app; the ChromeOS hardware-feature advice does not apply, and
+    // it is the only thing standing between `lint` and a clean run. Everything else stays on —
+    // lint is what caught createForSubscriptionId being API 31 while minSdk is 26.
+    lint {
+        disable += "PermissionImpliesUnsupportedChromeOsHardware"
+        abortOnError = true
+    }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

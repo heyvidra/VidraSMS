@@ -92,7 +92,12 @@ class ForwardService : Service() {
             // again mid-request and the poll dies half-finished.
             val wl = getSystemService(PowerManager::class.java)
                 ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "codebox:poll")
-            runCatching { wl?.acquire(90_000L) }
+            // 4 minutes, not 90s: a poll can carry two queued sends, each waiting up to 45s for
+            // its delivery report, and the lock expiring mid-send let the CPU suspend between the
+            // send and the ack — a row claimed server-side with no result ever written back. Held
+            // only as long as the work actually takes (released in the finally), so the ceiling
+            // costs nothing on a normal empty poll. Stays under the server's 5-minute claim window.
+            runCatching { wl?.acquire(4 * 60_000L) }
             try {
                 // Stamp before the work: what matters is when we last managed to run at all.
                 // Always judged against the ASLEEP interval, never the current one: the screen

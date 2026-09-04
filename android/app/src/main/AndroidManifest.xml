@@ -8,9 +8,14 @@
     <!-- Sending is only reachable once the app is the default SMS app (which exempts it from
          the hard SMS-permission restriction); the outbox is polled and sent from there. -->
     <uses-permission android:name="android.permission.SEND_SMS" />
-    <!-- Only to map a chosen SIM slot to its subscription when sending on a dual-SIM phone;
-         optional — falls back to the default SIM if not granted. -->
+    <!-- Maps a chosen SIM slot to its subscription when sending on a dual-SIM phone. Without it
+         an explicitly chosen SIM is refused (rather than silently sent on the other card). -->
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+    <!-- Reading the system SMS database: the 已有短信 backfill and the system half of sync-delete.
+         Hard-restricted like SEND_SMS, so it is only ever granted alongside the default-SMS role;
+         on a phone that never holds the role it simply stays denied and those two features report
+         that instead of failing silently. -->
+    <uses-permission android:name="android.permission.READ_SMS" />
     <uses-permission android:name="android.permission.INTERNET" />
 
     <!-- In-app updater: launch the system package installer for the downloaded APK. The install

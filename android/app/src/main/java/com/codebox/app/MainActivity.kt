@@ -1,6 +1,7 @@
 package com.codebox.app
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.ClipData
@@ -236,6 +237,8 @@ class MainActivity : Activity() {
         }.start()
         val filter = IntentFilter(NEW_ACTION)
         // Our own broadcast, so NOT_EXPORTED is correct (and forwardNow sets the package).
+        // lint flags the else-branch without following the version check around it.
+        @SuppressLint("UnspecifiedRegisterReceiverFlag")
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(newArrived, filter, Context.RECEIVER_NOT_EXPORTED)
         else registerReceiver(newArrived, filter)
     }
@@ -822,6 +825,7 @@ class MainActivity : Activity() {
                 })
             }
         }
+        sendDiagSection(content)
         content.addView(statusLine("—— 厂商保活（开好后打勾）——", muted, top = dp(14)))
         for (it in oemKeepalive()) content.addView(kaRow(it))
         // Mirroring into the system SMS DB is what handed the stock Messages app a reason to be
@@ -880,6 +884,165 @@ class MainActivity : Activity() {
                 Toast.makeText(this, "已清零，从现在开始重新统计", Toast.LENGTH_SHORT).show()
             }
             .show()
+    }
+
+    // The real send-capability state, one gate per line.
+    //
+    // "是默认短信应用" does NOT imply "可以发短信", and neither does "SEND_SMS 已授予": the role,
+    // the runtime permission, the AppOp and the subscription each fail on their own, and an
+    // IGNORED AppOp in particular lets the platform accept a send and silently drop it. Collapsing
+    // them into one ✅ is what made every failure look the same from here.
+    private fun sendDiagSection(content: LinearLayout) {
+        content.addView(statusLine("—— 发送诊断 ——", muted, top = dp(14)))
+        val c = smsCapabilities(this)
+        val bad = 0xFFEF4444.toInt()
+        fun mark(ok: Boolean) = if (ok) "✅" else "❌"
+
+        content.addView(statusLine("${mark(c.roleHeld)} SMS Role（默认短信应用）", top = dp(4)))
+        content.addView(statusLine("　　旧版默认包名：${c.defaultSmsPackage.ifEmpty { "（空）" }}", muted))
+        // Worth its own line: the role and the legacy setting disagreeing is a real ColorOS state,
+        // and it is the one that used to show "已是默认" while sending stayed barred.
+        if (c.roleMismatch(packageName))
+            content.addView(statusLine("⚠️ Role 与旧版默认设置不一致（以 Role 为准）", bad))
+        if (!c.roleAvailable)
+            content.addView(statusLine("⚠️ 本机不支持 ROLE_SMS", bad))
+
+        content.addView(statusLine("${mark(c.sendGranted)} SEND_SMS 权限"))
+        // The exact shape of "过一会又发不了了": the role is still held, so nothing looks wrong on
+        // the default-app screen, but the permission underneath it has been taken away.
+        if (c.roleHeld && !c.sendGranted)
+            content.addView(statusLine("❗ 仍是默认短信应用，但 SEND_SMS 已被系统撤销", bad))
+        val opOk = c.appOpSendSms == "ALLOWED"
+        content.addView(statusLine(
+            "${mark(opOk)} SEND_SMS AppOps：${c.appOpSendSms}", if (opOk) ink else bad,
+        ))
+        if (c.sendGranted && !opOk)
+            content.addView(statusLine("　　权限显示已授予但 AppOps 未放行——系统会静默丢弃短信", bad))
+        content.addView(statusLine("${mark(c.receiveGranted)} RECEIVE_SMS 权限", muted))
+        content.addView(statusLine("${mark(c.readPhoneStateGranted)} READ_PHONE_STATE 权限", muted))
+        content.addView(statusLine("${mark(c.readSmsGranted)} READ_SMS 权限（读系统短信/同步/同步删除）", muted))
+
+        val subs = c.subs
+        content.addView(statusLine(
+            when {
+                subs == null -> "❌ SIM：读不到（缺 READ_PHONE_STATE）"
+                subs.isEmpty() -> "❌ SIM：无在用卡"
+                else -> "✅ SIM：" + subs.joinToString("，") {
+                    "SIM ${it.slot + 1}(sub=${it.subId}${if (it.carrier.isNotEmpty()) " " + it.carrier else ""})"
+                }
+            },
+            if (subs.isNullOrEmpty()) bad else ink,
+        ))
+
+        // Did the web command even reach this phone? Separating that from "the SMS didn't go out"
+        // is the whole point — without it both present as 卡在发送中.
+        val (pollAge, pollErr, lastOut) = pollStatus(this)
+        content.addView(statusLine(
+            if (pollAge < 0) "◻️ 尚未完成过一次轮询"
+            else "上次轮询：${pollAge / 1000} 秒前" + if (pollErr.isEmpty()) "（正常）" else "（失败：$pollErr）",
+            if (pollErr.isEmpty()) muted else bad,
+        ))
+        content.addView(statusLine(
+            "上次收到的发送任务：" + if (lastOut < 0) "无" else "#$lastOut", muted,
+        ))
+        val last = getSharedPreferences("dev", MODE_PRIVATE).getString("lastSend", "").orEmpty()
+        content.addView(statusLine("上次发送：" + last.ifEmpty { "（无记录）" },
+            if (last.contains("成功") || last.isEmpty()) muted else bad))
+        val fgRunning = isForwardServiceRunning()   // one binder call, not two
+        content.addView(statusLine(
+            "转发服务：" + if (fgRunning) "运行中" else "未运行",
+            if (fgRunning) muted else bad,
+        ))
+        content.addView(linkRow("本机短信测试（不经过网页/服务器）") { smsTestDialog() })
+    }
+
+    // Whether ForwardService is actually resident. getRunningServices is deprecated for inspecting
+    // OTHER apps, but still returns our own services — which is all this needs, and is the only
+    // honest answer to "是不是被 ROM 杀了".
+    @Suppress("DEPRECATION")
+    private fun isForwardServiceRunning(): Boolean = runCatching {
+        val am = getSystemService(android.app.ActivityManager::class.java) ?: return false
+        am.getRunningServices(64).any { it.service.className == ForwardService::class.java.name }
+    }.getOrDefault(false)
+
+    // Send an SMS straight through SmsSender, bypassing the web, the Worker, D1, the outbox and the
+    // poll. That is the only way to split "网页的命令没到手机" from "手机发不出去" — the two produce
+    // exactly the same symptom (卡在发送中) and no amount of server-side data separates them.
+    private fun smsTestDialog() {
+        val pad = dp(20)
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; setPadding(pad, dp(8), pad, dp(4))
+        }
+        val to = android.widget.EditText(this).apply {
+            hint = "号码"; inputType = android.text.InputType.TYPE_CLASS_PHONE; textSize = 15f
+        }
+        val msg = android.widget.EditText(this).apply {
+            hint = "短信内容"; setText("测试 " + android.text.format.DateFormat.format("HH:mm:ss", java.util.Date()))
+            textSize = 15f
+        }
+        box.addView(to); box.addView(msg)
+
+        // Only offer slots that actually exist; 默认 always. Choosing a slot means it — the send
+        // now refuses rather than quietly using the other card.
+        val subs = activeSubs(this)
+        val slotOfId = HashMap<Int, Int?>()
+        val group = android.widget.RadioGroup(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            fun option(label: String, slot: Int?) {
+                val b = android.widget.RadioButton(context).apply {
+                    text = label; id = View.generateViewId(); isChecked = slot == null
+                }
+                slotOfId[b.id] = slot
+                addView(b)
+            }
+            option("默认", null)
+            subs?.forEach { option("SIM ${it.slot + 1}", it.slot) }
+        }
+        box.addView(group)
+        if (subs == null) box.addView(statusLine("（读不到卡列表：缺 READ_PHONE_STATE）", muted))
+
+        val out = TextView(this).apply {
+            textSize = 12.5f; setTextColor(muted); setPadding(0, dp(10), 0, 0)
+            typeface = Typeface.MONOSPACE
+            setTextIsSelectable(true)   // so the result can be copied into a bug report
+        }
+        box.addView(out)
+
+        val dlg = AlertDialog.Builder(this).setTitle("本机 SMS 测试")
+            .setView(ScrollView(this).apply { addView(box) })
+            .setPositiveButton("发送测试", null)      // null: wired below so it does not dismiss
+            .setNegativeButton("关闭", null)
+            .create()
+        dlg.show()
+        dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            val number = to.text.toString().trim()
+            if (number.isEmpty()) { out.text = "请输入号码"; return@setOnClickListener }
+            val slot = slotOfId[group.checkedRadioButtonId]
+            out.text = "发送中…"
+            val app = applicationContext
+            val body = msg.text.toString()
+            // Off the main thread: sendSms blocks until the delivery report arrives (up to 45s).
+            Thread {
+                val caps = smsCapabilities(app)
+                val r = sendSmsLocally(app, number, body, slot)
+                runOnUiThread {
+                    out.text = buildString {
+                        append("attemptId : ").append(r.attemptId).append('\n')
+                        append("目标SIM   : ").append(slot?.let { "SIM ${it + 1}" } ?: "默认").append('\n')
+                        append("权限      : SEND_SMS=").append(if (caps.sendGranted) "GRANTED" else "DENIED").append('\n')
+                        append("AppOps    : ").append(caps.appOpSendSms).append('\n')
+                        append("Role      : ").append(if (caps.roleHeld) "HELD" else "NOT_HELD").append('\n')
+                        append("订阅      : ").append(
+                            caps.subs?.joinToString("/") { "${it.slot + 1}:sub${it.subId}" } ?: "读不到"
+                        ).append('\n')
+                        append("结果码    : ").append(r.code).append('\n')
+                        append("详情      : ").append(r.detail).append('\n')
+                        append("最终结果  : ").append(if (r.ok) "成功" else sendLabel(r.code))
+                    }
+                    out.setTextColor(if (r.ok) 0xFF16A34A.toInt() else 0xFFEF4444.toInt())
+                }
+            }.start()
+        }
     }
 
     private fun statusLine(text: String, color: Int = ink, top: Int = dp(3)): TextView =

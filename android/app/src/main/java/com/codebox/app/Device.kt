@@ -248,6 +248,7 @@ fun currentTransport(ctx: Context): String = runCatching {
 // status bar shows; 5G NSA can still report LTE here, which is a known platform limitation we
 // accept rather than wire up a TelephonyDisplayInfo listener for a corner watermark.
 // ponytail: dataNetworkType only; TelephonyDisplayInfo if true-5G-NSA detection ever matters.
+@android.annotation.SuppressLint("MissingPermission")   // the runCatching below IS the handling
 private fun cellGen(ctx: Context): String = runCatching {
     val tm = ctx.applicationContext
         .getSystemService(android.telephony.TelephonyManager::class.java) ?: return "蜂窝"

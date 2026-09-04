@@ -1529,6 +1529,7 @@ async function renderBeat(){
     next.set(d.id, {
       id: d.id, ts: d.ts, name: info?.n || ("设备 " + d.id.slice(0, 4)),
       sims: info?.s || [], caps: info?.c || null, gaps: info?.g || null, ver: info?.v || null, tr: info?.t || null, os: info?.os || null, ls: info?.ls || null,
+      cap: info?.cap || null, pp: info?.pp || null,
     });
   }
   DEVS = next;
@@ -1694,6 +1695,34 @@ async function renderBeat(){
       l.textContent = "上次发送 " + d.ls;
       l.title = l.textContent;
       sub.append(l);
+    }
+    // The four send gates as the phone itself sees them — role / SEND_SMS / AppOps / SIM. They
+    // fail independently (a granted permission with an IGNORED AppOp sends nothing and says
+    // nothing), so a single "可发送 ✅" could never explain a failure. Red as soon as any is off.
+    if (d.cap) {
+      const txt = String(d.cap);
+      const bad = txt.includes("role-") || txt.includes("send-") ||
+        (txt.includes("op:") && !txt.includes("op:ALLOWED") && !txt.includes("op:DEFAULT"));
+      const c = document.createElement("div");
+      c.className = bad ? "dev-warn" : "dev-sims";
+      c.textContent = "发送条件 " + txt;
+      c.title = c.textContent;
+      sub.append(c);
+    }
+    // Did the phone's poll reach the server, and which send task did it last pick up? This is what
+    // separates "网页的命令没到手机" from "手机收到了但发不出去" — previously indistinguishable.
+    if (d.pp && d.pp.length > 1) {
+      const err = String(d.pp[0] || ""), lastId = Number(d.pp[1]);
+      if (err) {
+        const e = document.createElement("div"); e.className = "dev-warn";
+        e.textContent = "轮询失败 " + err;
+        sub.append(e);
+      }
+      if (lastId >= 0) {
+        const o = document.createElement("div"); o.className = "dev-sims";
+        o.textContent = "最近取到发送任务 #" + lastId;
+        sub.append(o);
+      }
     }
     // One line per SIM rather than "a / b": on a dual-SIM phone joining them just pushed the
     // second card past the ellipsis, which is exactly the one you needed to see.

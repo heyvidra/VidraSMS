@@ -43,51 +43,103 @@ fun openSealed(keyHex: String, payload: String): JSONObject? {
     }
 }
 
-// SmsManager for a chosen SIM slot (0/1). Falls back to the default SIM when the slot is
-// unset, unreadable (no READ_PHONE_STATE), or empty — single-SIM phones never hit the map.
+// A gate that stops a send before it starts, carrying the code that says which gate it was.
+// Thrown rather than returned so every early exit funnels through the one catch in sendSms —
+// nothing may leave that function by any other door (see the comment there).
+private class SendFail(val code: String, val why: String) : Exception(why)
+
+// SmsManager for a chosen SIM slot (0/1). Only slot == null ("默认") uses the system default
+// subscription. Asking for SIM 1 and quietly sending on SIM 2 used to be the behaviour here; it is
+// both wrong (the message leaves on the wrong card, with the wrong number and the wrong balance)
+// and a diagnostic dead end, because the failure then looks identical to a healthy send. An
+// unresolvable slot is now an error that names the slots that DO exist.
 private fun smsManagerFor(ctx: Context, slot: Int?): SmsManager {
     @Suppress("DEPRECATION")
-    val base = if (Build.VERSION.SDK_INT >= 31) ctx.getSystemService(SmsManager::class.java)
-               else SmsManager.getDefault()
+    val base: SmsManager = (if (Build.VERSION.SDK_INT >= 31) ctx.getSystemService(SmsManager::class.java)
+                            else SmsManager.getDefault())
+        ?: throw SendFail(Send.UNKNOWN, "系统未提供 SmsManager")
     if (slot == null) return base
-    val sub = subIdForSlot(ctx, slot) ?: return base
-    return try { base.createForSubscriptionId(sub) } catch (e: Exception) { base }
+    val subs = activeSubs(ctx)
+        ?: throw SendFail(Send.SUBSCRIPTION_UNAVAILABLE, "指定 SIM ${slot + 1}，但读不到卡列表（READ_PHONE_STATE 未授予）")
+    val sub = subs.firstOrNull { it.slot == slot }
+        ?: throw SendFail(
+            Send.SUBSCRIPTION_UNAVAILABLE,
+            "指定 SIM ${slot + 1} 无对应卡；在用：" +
+                (subs.joinToString("/") { "SIM ${it.slot + 1}" }.ifEmpty { "无" }),
+        )
+    // createForSubscriptionId is API 31. compileSdk 34 compiles the call happily, but on an
+    // Android 8-11 handset the method is simply not there and the platform throws
+    // NoSuchMethodError — an Error, not an Exception, so the previous `catch (e: Exception)` did
+    // not catch it and it unwound straight out of the send. minSdk here is 26, and both OPPOs are
+    // below 31. getSmsManagerForSubscriptionId is the API 22 equivalent (deprecated at 31).
+    return try {
+        if (Build.VERSION.SDK_INT >= 31) base.createForSubscriptionId(sub.subId)
+        else @Suppress("DEPRECATION") SmsManager.getSmsManagerForSubscriptionId(sub.subId)
+    } catch (e: Throwable) {
+        throw SendFail(
+            Send.SUBSCRIPTION_UNAVAILABLE,
+            "SIM ${slot + 1}(sub=${sub.subId}) 绑定失败：${e.javaClass.simpleName}",
+        )
+    }
 }
 
-// Subscription behind a slot (0/1), or null when unknown — no READ_PHONE_STATE, empty slot,
-// or a single-SIM phone. Also used to tag the stored copy of a sent message with its SIM.
+// Subscription behind a slot (0/1), or null when unknown. Only used to tag the stored copy of a
+// sent message with its SIM — the send path itself resolves the slot through smsManagerFor, which
+// refuses rather than falls back.
 private fun subIdForSlot(ctx: Context, slot: Int?): Int? {
     if (slot == null) return null
-    return try {
-        ctx.getSystemService(SubscriptionManager::class.java)
-            ?.getActiveSubscriptionInfoForSimSlotIndex(slot)?.subscriptionId
-    } catch (e: SecurityException) {
-        null
-    } catch (e: Exception) {
-        null
-    }
+    return activeSubs(ctx)?.firstOrNull { it.slot == slot }?.subId
 }
 
-// Sends and blocks until every part reports a result (or times out). Safe only off the main
-// thread — the poll loop calls it from a background executor. Returns (ok, detail-for-ack).
-fun sendSms(ctx: Context, to: String, body: String, slot: Int?): Pair<Boolean, String> {
-    if (to.isBlank() || body.isEmpty()) return false to "空号码或内容"
-    val sm = smsManagerFor(ctx, slot)
-    val parts = sm.divideMessage(body)
-    val latch = CountDownLatch(parts.size)
-    val codes = java.util.Collections.synchronizedList(mutableListOf<Int>())
-    val action = "com.codebox.app.SENT." + System.nanoTime()
+// Sends and blocks until every part reports a delivery result (or times out). Safe only off the
+// main thread — the poll loop calls it from a background executor.
+//
+// NOTHING may escape this function. Every gate, every platform exception and every timeout comes
+// back as a SendOutcome, because the caller's contract is that a claimed outbox row is ALWAYS
+// acked. The previous version resolved the SmsManager, split the message and registered the
+// receiver *outside* its try block, so a throw from any of the three unwound straight past the
+// ack — the row stayed "发送中" server-side with no reason recorded anywhere, which is exactly
+// the failure that could not be diagnosed from the web.
+fun sendSms(ctx: Context, to: String, body: String, slot: Int?): SendOutcome {
+    val attempt = newAttemptId()
+    if (to.isBlank() || body.isEmpty()) return SendOutcome(Send.EMPTY, "空号码或内容", attempt)
 
-    val receiver = object : BroadcastReceiver() {
-        override fun onReceive(c: Context?, i: Intent?) { codes.add(resultCode); latch.countDown() }
-    }
-    // Own broadcast (system delivers the sentIntent to our package) → NOT_EXPORTED on 33+.
-    if (Build.VERSION.SDK_INT >= 33)
-        ctx.registerReceiver(receiver, IntentFilter(action), Context.RECEIVER_NOT_EXPORTED)
-    else
-        ctx.registerReceiver(receiver, IntentFilter(action))
+    // Pre-flight. These three can each make a send impossible while the other two look fine, and
+    // two of them fail *silently* at the platform level — an IGNORED AppOp accepts the send and
+    // drops it, returning no exception and no delivery report, i.e. it would present as a timeout.
+    val caps = smsCapabilities(ctx)
+    preflight(caps, attempt)?.let { return it }
 
+    // Never the body, never the number: this line goes to logcat, which is not a private place.
+    Log.i(TAG, "$attempt start slot=${slot ?: "default"} len=${body.length} ${capsCompact(caps)}")
+
+    var receiver: BroadcastReceiver? = null
     return try {
+        val sm = smsManagerFor(ctx, slot)
+        val parts = sm.divideMessage(body)
+            ?: throw SendFail(Send.ILLEGAL_ARGUMENT, "divideMessage 返回 null")
+        if (parts.isEmpty()) throw SendFail(Send.ILLEGAL_ARGUMENT, "divideMessage 返回空列表")
+
+        val latch = CountDownLatch(parts.size)
+        // (resultCode, errorCode). The errorCode extra is the radio-technology specific value the
+        // platform attaches to a failed sentIntent; reading only resultCode threw away the one
+        // field that distinguishes one GENERIC_FAILURE from another.
+        val results = java.util.Collections.synchronizedList(mutableListOf<Pair<Int, Int>>())
+        val action = "com.codebox.app.SENT.$attempt"
+        receiver = object : BroadcastReceiver() {
+            override fun onReceive(c: Context?, i: Intent?) {
+                results.add(resultCode to (i?.getIntExtra("errorCode", -1) ?: -1))
+                latch.countDown()
+            }
+        }
+        // Our own broadcast (the system delivers the sentIntent back to our package), so it must
+        // be NOT_EXPORTED on 33+ — an exported receiver here would be a hole, and on 34 an
+        // unflagged registration is a hard crash.
+        if (Build.VERSION.SDK_INT >= 33)
+            ctx.registerReceiver(receiver, IntentFilter(action), Context.RECEIVER_NOT_EXPORTED)
+        else
+            ctx.registerReceiver(receiver, IntentFilter(action))
+
         val sentIntents = ArrayList<PendingIntent>(parts.size)
         for (i in parts.indices) {
             sentIntents.add(
@@ -99,62 +151,169 @@ fun sendSms(ctx: Context, to: String, body: String, slot: Int?): Pair<Boolean, S
         }
         sm.sendMultipartTextMessage(to, null, ArrayList(parts), sentIntents, null)
 
-        if (!latch.await(60, TimeUnit.SECONDS)) return false to "超时未回执（信号弱/无服务）"
-        val bad = codes.firstOrNull { it != Activity.RESULT_OK }
-        if (bad != null) return false to smsErr(bad)
-        // Being the default SMS app also means owning the record of what was sent — without this
-        // the message would leave the phone without appearing in any conversation on it.
-        storeSent(ctx, to, body, subIdForSlot(ctx, slot) ?: -1)
-        true to ""
-    } catch (e: Exception) {
-        false to (e.message ?: "发送异常")
+        if (!latch.await(SEND_WAIT_SEC, TimeUnit.SECONDS)) {
+            // Genuinely unknown: the modem may well have submitted it. Treated as "do not retry"
+            // upstream so a weak-signal send can't turn into two received messages.
+            // 0 of N is a different diagnosis from 2 of 3: nothing came back at all means the
+            // sentIntent callback itself never arrived — the broadcast was dropped, or this
+            // process was frozen between the send and the report — whereas a partial count means
+            // the modem is answering and simply hasn't finished.
+            val got = results.size
+            return SendOutcome(
+                Send.TIMEOUT,
+                if (got == 0) "${SEND_WAIT_SEC}s 内 0/${parts.size} 个回执（sentIntent 回调未到达：广播被丢弃或进程被冻结）"
+                else "${SEND_WAIT_SEC}s 内只收到 $got/${parts.size} 个回执", attempt,
+            )
+        }
+        val bad = results.firstOrNull { it.first != Activity.RESULT_OK }
+        if (bad != null) {
+            val (rc, ec) = bad
+            return SendOutcome(
+                sendCodeFor(rc),
+                "${resultCodeName(rc)}(${rc})" + if (ec >= 0) " errorCode=$ec" else "",
+                attempt,
+            )
+        }
+        // Being the default SMS app also means owning the record of what was sent (no-op unless
+        // the 抄送 switch is on).
+        runCatching { storeSent(ctx, to, body, subIdForSlot(ctx, slot) ?: -1) }
+        SendOutcome(Send.OK, "${parts.size}段全部回执成功", attempt)
+    } catch (e: SendFail) {
+        SendOutcome(e.code, e.why, attempt)
+    } catch (e: SecurityException) {
+        SendOutcome(Send.SECURITY_EXCEPTION, "SecurityException: ${e.message ?: "无详情"}", attempt)
+    } catch (e: IllegalArgumentException) {
+        SendOutcome(Send.ILLEGAL_ARGUMENT, "IllegalArgumentException: ${e.message ?: "无详情"}", attempt)
+    } catch (e: Throwable) {
+        // Throwable, not Exception, and on purpose: the contract above is absolute. Whatever this
+        // was, the row still gets acked with the real class name instead of vanishing.
+        SendOutcome(Send.UNKNOWN, "${e.javaClass.simpleName}: ${e.message ?: "无详情"}", attempt)
     } finally {
-        runCatching { ctx.unregisterReceiver(receiver) }
+        receiver?.let { r -> runCatching { ctx.unregisterReceiver(r) } }
     }
 }
 
-// Human-readable SMS send failure, so the web shows WHY a send failed instead of a bare code.
-private fun smsErr(code: Int): String = when (code) {
-    SmsManager.RESULT_ERROR_GENERIC_FAILURE -> "通用失败(1)"
-    SmsManager.RESULT_ERROR_RADIO_OFF -> "射频关闭/飞行模式(2)"
-    SmsManager.RESULT_ERROR_NULL_PDU -> "空PDU(3)"
-    SmsManager.RESULT_ERROR_NO_SERVICE -> "无服务/无信号(4)"
-    else -> "结果码 $code"
-}
+// Long enough for a real delivery report on a weak network, short enough that two queued messages
+// still finish inside the service's wake lock and the server's 5-minute claim window.
+private const val SEND_WAIT_SEC = 45L
 
 // Remember the last send outcome on the device, so it rides up in the devinfo blob and shows on the
 // web card even when the outbox row only got the server's generic "多次尝试未送达" (which fires when
-// the phone was killed mid-send and never acked). This is the real, per-attempt reason.
-private fun recordLastSend(ctx: Context, ok: Boolean, detail: String) {
-    val label = if (ok) "成功" else "失败：$detail"
+// the phone never acked). This is the real, per-attempt reason.
+private fun recordLastSend(ctx: Context, outboxId: Long?, out: SendOutcome) {
+    val who = if (outboxId != null) "#$outboxId " else "本机测试 "
     ctx.applicationContext.getSharedPreferences("dev", Context.MODE_PRIVATE)
-        .edit().putString("lastSend", label).apply()
+        .edit().putString("lastSend", who + out.line()).apply()
 }
 
-// Pull pending sends, send each, ack. Called on a background thread by CodeListener's poller.
-// One at a time is fine for manual use; sendSms blocks per message.
+// Public wrapper for the on-device test dialog: same send path as the web, minus the network.
+fun sendSmsLocally(ctx: Context, to: String, body: String, slot: Int?): SendOutcome =
+    sendSms(ctx, to, body, slot).also { recordLastSend(ctx, null, it) }
+
+// --- outbox ------------------------------------------------------------------------------------
+
+// Pull pending sends, send each, ack. Called on a background thread by ForwardService's poller.
 fun pollOutbox(ctx: Context) {
     if (!configured()) return
     // Poll bases in priority order; the first that answers /api/outbox (which also stamps the
-    // heartbeat) is used for the whole cycle — sims + acks go to the same door. A blocked or
-    // dead primary falls through to the next; if none answer, next poll retries.
+    // heartbeat) is used for the whole cycle — acks go to the same door. A blocked or dead primary
+    // falls through to the next; if none answer, the reason is recorded rather than swallowed.
     val dev = deviceId(ctx)
+    var lastErr = "NO_BASE"
     for (base in bases()) {
-        val listJson = httpGet("$base/api/outbox?dev=$dev") ?: continue
-        reportDevInfo(ctx, base, dev)
-        val arr = try { JSONArray(listJson) } catch (e: Exception) { return }
+        val res = httpGetDiag("$base/api/outbox?dev=$dev")
+        val bodyText = res.body
+        if (bodyText == null) { lastErr = res.error; continue }
+        notePoll(ctx, res.error)
+        runCatching { reportDevInfo(ctx, base, dev) }
+        val arr = try { JSONArray(bodyText) } catch (e: Exception) {
+            notePoll(ctx, "OUTBOX_JSON_INVALID"); return
+        }
         for (i in 0 until arr.length()) {
-            val row = arr.getJSONObject(i)
-            val id = row.getLong("id")
-            val cmd = openSealed(BuildConfig.SMS_KEY, row.getString("payload"))
-            val (ok, detail) = if (cmd == null) false to "解密失败"
-                else sendSms(ctx, cmd.optString("to"), cmd.optString("body"), slotOf(cmd.optString("sim")))
-            ackOutbox(base, id, ok, detail)
-            recordLastSend(ctx, ok, detail)
+            // Nothing here may abort the cycle. One row that throws used to take the remaining
+            // rows, the ack and pollDeletions down with it.
+            runCatching { handleOutboxRow(ctx, base, arr.getJSONObject(i)) }
+                .onFailure { Log.e(TAG, "outbox row handling failed", it) }
         }
         runCatching { pollDeletions(ctx, base) }
         return
     }
+    notePoll(ctx, lastErr)
+}
+
+// One claimed row: decrypt, send, ack. Always acks — including for a row it refuses to re-send.
+private fun handleOutboxRow(ctx: Context, base: String, row: org.json.JSONObject) {
+    val id = row.getLong("id")
+    // Already handled, ack lost. The server hands a claimed row back after its claim window, so
+    // without this a dropped ack means the recipient receives the SMS a second time. "Handled"
+    // deliberately includes a timeout, whose SMS may well have gone out — an unacknowledged send
+    // is unknown, not absent, and duplicating it is the worse of the two mistakes.
+    doneOutcome(ctx, id)?.let { prior ->
+        Log.w(TAG, "outbox #$id re-served; re-acking ${prior.code} instead of re-sending")
+        ackOutbox(base, id, prior); return
+    }
+    noteOutboxSeen(ctx, id)
+    val cmd = openSealed(BuildConfig.SMS_KEY, row.optString("payload"))
+    val out = if (cmd == null) SendOutcome(Send.DECRYPT_FAILED, "密文无法解密（SMS_KEY 不匹配？）", newAttemptId())
+    else sendSms(ctx, cmd.optString("to"), cmd.optString("body"), slotOf(cmd.optString("sim")))
+    Log.i(TAG, "outbox #$id -> ${out.code} ${out.detail} [${out.attemptId}]")
+    if (out.ok || out.code == Send.TIMEOUT) markDone(ctx, id, out.code)
+    recordLastSend(ctx, id, out)
+    ackOutbox(base, id, out)
+}
+
+// --- "already handled" ring --------------------------------------------------------------------
+// The smallest thing that stops a lost ack from becoming a duplicate SMS. Not a full state
+// machine: the server already owns QUEUED/CLAIMED/SENT, and all the phone has to add is "I have
+// finished with this id", which one bounded string covers.
+private const val DONE_RING_MAX = 40
+
+// "12=SEND_OK,13=SEND_TIMEOUT" — newest last, oldest dropped past the cap.
+internal fun doneRingPut(ring: String, id: Long, code: String, max: Int = DONE_RING_MAX): String =
+    (ring.split(",").filter { it.isNotBlank() && it.substringBefore('=') != id.toString() } + "$id=$code")
+        .takeLast(max).joinToString(",")
+
+internal fun doneRingGet(ring: String, id: Long): String? =
+    ring.split(",").firstOrNull { it.substringBefore('=') == id.toString() }
+        ?.substringAfter('=')?.takeIf { it.isNotBlank() }
+
+private fun doneOutcome(ctx: Context, id: Long): SendOutcome? {
+    val ring = ctx.getSharedPreferences("outbox", Context.MODE_PRIVATE).getString("done", "").orEmpty()
+    val code = doneRingGet(ring, id) ?: return null
+    return SendOutcome(code, "此前已处理，重发请求已忽略", "replay")
+}
+
+private fun markDone(ctx: Context, id: Long, code: String) {
+    val p = ctx.getSharedPreferences("outbox", Context.MODE_PRIVATE)
+    p.edit().putString("done", doneRingPut(p.getString("done", "").orEmpty(), id, code)).apply()
+}
+
+// --- poll observability --------------------------------------------------------------------
+// "did the web command even reach this phone" is a different question from "did the SMS go out",
+// and until these were recorded the two were indistinguishable from the browser.
+private fun notePoll(ctx: Context, err: String) {
+    ctx.getSharedPreferences("outbox", Context.MODE_PRIVATE).edit()
+        .putLong("lastPollAt", System.currentTimeMillis())
+        .putString("lastPollErr", err)
+        .apply()
+}
+
+private fun noteOutboxSeen(ctx: Context, id: Long) {
+    ctx.getSharedPreferences("outbox", Context.MODE_PRIVATE).edit()
+        .putLong("lastOutboxAt", System.currentTimeMillis())
+        .putLong("lastOutboxId", id)
+        .apply()
+}
+
+// (millis since the last completed poll or -1, why it failed or "", last outbox id or -1)
+fun pollStatus(ctx: Context): Triple<Long, String, Long> {
+    val p = ctx.getSharedPreferences("outbox", Context.MODE_PRIVATE)
+    val at = p.getLong("lastPollAt", 0L)
+    return Triple(
+        if (at == 0L) -1L else System.currentTimeMillis() - at,
+        p.getString("lastPollErr", "").orEmpty(),
+        p.getLong("lastOutboxId", -1L),
+    )
 }
 
 // Mirror web deletions onto this phone. A message can live in three places here: our own list
@@ -301,7 +460,16 @@ private fun reportDevInfo(ctx: Context, base: String, dev: String) {
     val (gapCount, gapMax) = aliveGaps(ctx)
     val (netWakes, netNoNet) = netWakes(ctx)
     val lastSend = ctx.getSharedPreferences("dev", Context.MODE_PRIVATE).getString("lastSend", "").orEmpty()
-    val json = """{"n":"${jsonEscape(deviceName())}","s":$sims,"c":{$caps},"g":[$gapCount,$gapMax,${worstGapMinutes(ctx)},$netWakes,$netNoNet],"t":"${currentTransport(ctx)}","os":"${jsonEscape(osLabel())}","ls":"${jsonEscape(lastSend)}","v":"${jsonEscape(BuildConfig.VERSION_NAME)}"}"""
+    // The send gates, verbatim, so the browser sees exactly what the phone sees. Without this a
+    // failed send could not be attributed from the web: role, permission and AppOps come apart
+    // independently, and the card previously showed only a single "可发送" boolean for all three.
+    val smsCap = capsCompact(smsCapabilities(ctx))
+    // Deliberately NOT the poll timestamp: the server stamps that itself on every /api/outbox,
+    // and putting a value that changes each cycle in here would defeat the write-dedup below and
+    // turn ~50 D1 writes a day into ~4300. Only the two stable facts travel — why the last poll
+    // failed, and the last outbox row this phone saw.
+    val (_, pollErr, lastOut) = pollStatus(ctx)
+    val json = """{"n":"${jsonEscape(deviceName())}","s":$sims,"c":{$caps},"g":[$gapCount,$gapMax,${worstGapMinutes(ctx)},$netWakes,$netNoNet],"t":"${currentTransport(ctx)}","os":"${jsonEscape(osLabel())}","ls":"${jsonEscape(lastSend)}","v":"${jsonEscape(BuildConfig.VERSION_NAME)}","cap":"${jsonEscape(smsCap)}","pp":["${jsonEscape(pollErr)}",$lastOut]}"""
     val now = System.currentTimeMillis()
     if (json == lastSims && now - lastSimsAt < SIMS_REFRESH_MS) return
     if (httpPostText("$base/api/devinfo?dev=$dev", encrypt(BuildConfig.SMS_KEY, json))) {
@@ -336,21 +504,41 @@ private fun simListJson(ctx: Context): String? {
     }
 }
 
-private fun httpGet(url: String): String? {
+// A GET that says WHY it failed. The old one collapsed DNS failure, a TLS error, a 403 from a
+// wrong token and a 500 into the same `null`, so a phone that could not reach the server at all
+// was indistinguishable from one with nothing to send — and "网页发的命令没到手机" could not be
+// separated from "手机收到了但发不出去". error is "" only on success.
+internal class HttpResult(val body: String?, val error: String)
+
+internal fun classify(e: Exception, connected: Boolean): String = when (e) {
+    is java.net.UnknownHostException -> "DNS"
+    is javax.net.ssl.SSLException -> "TLS"
+    is java.net.SocketTimeoutException -> if (connected) "READ_TIMEOUT" else "CONNECT_TIMEOUT"
+    is java.net.ConnectException -> "CONNECT"
+    else -> e.javaClass.simpleName
+}
+
+private fun httpGetDiag(url: String): HttpResult {
     var conn: HttpURLConnection? = null
+    var connected = false
     return try {
         conn = (URL(url).openConnection() as HttpURLConnection).apply {
             connectTimeout = 15_000; readTimeout = 15_000
             setRequestProperty("Authorization", "Bearer ${BuildConfig.NTFY_TOKEN}")
         }
-        if (conn.responseCode != 200) null
-        else conn.inputStream.bufferedReader().use { it.readText() }
+        conn.connect()
+        connected = true
+        val code = conn.responseCode
+        if (code != 200) HttpResult(null, "HTTP_$code")
+        else HttpResult(conn.inputStream.bufferedReader().use { it.readText() }, "")
     } catch (e: Exception) {
-        null
+        HttpResult(null, classify(e, connected))
     } finally {
         conn?.disconnect()
     }
 }
+
+private fun httpGet(url: String): String? = httpGetDiag(url).body
 
 private fun httpPostText(url: String, body: String): Boolean {
     var conn: HttpURLConnection? = null
@@ -370,21 +558,30 @@ private fun httpPostText(url: String, body: String): Boolean {
     }
 }
 
-private fun ackOutbox(base: String, id: Long, ok: Boolean, detail: String) {
-    var conn: HttpURLConnection? = null
-    try {
-        conn = (URL("$base/api/outbox/ack").openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"; doOutput = true
-            connectTimeout = 15_000; readTimeout = 15_000
-            setRequestProperty("Authorization", "Bearer ${BuildConfig.NTFY_TOKEN}")
-            setRequestProperty("Content-Type", "application/json")
+// Report a send's result. Tries every base, not just the one the row came from: an ack that does
+// not land is what turns a delivered SMS into a duplicate five minutes later, so it is worth one
+// more round trip over the backup domain before giving up. The phone's own done-ring is the
+// backstop for the case where all of them fail.
+private fun ackOutbox(base: String, id: Long, out: SendOutcome) {
+    val detail = if (out.ok) out.attemptId else "${out.code}｜${out.detail} [${out.attemptId}]"
+    val body = """{"id":$id,"ok":${out.ok},"detail":"${jsonEscape(detail)}"}"""
+    val targets = listOf(base) + bases().filter { it != base }
+    for (b in targets) {
+        var conn: HttpURLConnection? = null
+        try {
+            conn = (URL("$b/api/outbox/ack").openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"; doOutput = true
+                connectTimeout = 15_000; readTimeout = 15_000
+                setRequestProperty("Authorization", "Bearer ${BuildConfig.NTFY_TOKEN}")
+                setRequestProperty("Content-Type", "application/json")
+            }
+            conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+            if (conn.responseCode in 200..299) return
+        } catch (e: Exception) {
+            Log.w(TAG, "ack failed id=$id via $b", e)
+        } finally {
+            conn?.disconnect()
         }
-        val body = """{"id":$id,"ok":$ok,"detail":"${jsonEscape(detail)}"}"""
-        conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-        conn.responseCode   // drain; ack is best-effort
-    } catch (e: Exception) {
-        Log.w(TAG, "ack failed id=$id", e)
-    } finally {
-        conn?.disconnect()
     }
+    Log.e(TAG, "ack #$id could not be delivered to any base; done-ring prevents a resend")
 }
