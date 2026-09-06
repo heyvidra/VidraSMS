@@ -427,9 +427,18 @@ fun simLabelForSub(ctx: Context, subId: Int): String? {
     }
 }
 
-// A missed-call notification carries no subscription id, so on a dual-SIM phone there is no
-// honest way to say which card rang — and a wrong SIM label is worse than none. With exactly one
-// active SIM there is only one possible answer, which covers most phones; otherwise stay silent.
+// A missed-call notification carries no subscription id — measured, not assumed: a real missed
+// call on Android 11 posts extras of exactly {title, text, largeIcon, appInfo, showWhen}, with no
+// PhoneAccountHandle and no sub id anywhere. So on a dual-SIM phone there is no honest way to say
+// which card rang from the notification alone, and a wrong SIM label is worse than none. With
+// exactly one active SIM there is only one possible answer, which covers most phones.
+//
+// Two ways out if this ever needs to work on a dual-SIM phone, neither implemented:
+//   1. The notification's TAG carries the call-log row URI ("MissedCall_content://call_log/calls/N")
+//      — query CallLog.Calls.PHONE_ACCOUNT_ID on it. Precise; needs READ_CALL_LOG declared.
+//   2. Register a per-subscription PhoneStateListener (TelephonyManager.createForSubscriptionId is
+//      API 24, unlike SmsManager's API 31 one) and remember which sub last went RINGING. Needs only
+//      READ_PHONE_STATE, but it is time correlation rather than true attribution.
 fun soleSimLabel(ctx: Context): String? {
     return try {
         val subs = ctx.getSystemService(SubscriptionManager::class.java)?.activeSubscriptionInfoList

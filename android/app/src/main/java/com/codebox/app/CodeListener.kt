@@ -60,8 +60,11 @@ class CodeListener : NotificationListenerService() {
             // A missed call is the only phone event worth a message: on a dedicated forwarding
             // phone nobody answers, so this fires once per missed call. Ringing / in-progress
             // notifications are deliberately ignored — they would double up. Read from the
-            // notification rather than the call log: READ_CALL_LOG is hard-restricted and a
-            // browser-sideloaded app can't hold it (ROLE_SMS exempts SMS only, not CALL_LOG).
+            // notification rather than the call log — but NOT because the call log is out of
+            // reach. That earlier claim was wrong: checked against the device's own roles.xml
+            // (pulled from GooglePermissionController.apk on an Android 11 image), ROLE_SMS grants
+            // permission-set "phone", and that set contains READ_CALL_LOG. The real reason is
+            // simply that we do not declare READ_CALL_LOG today, so there is nothing to read.
             dialerPkg != null && sbn.packageName == dialerPkg -> {
                 if (!isMissedCall(n)) return
                 io.execute {
