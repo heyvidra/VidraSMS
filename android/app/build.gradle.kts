@@ -70,6 +70,11 @@ android {
     // lint is what caught createForSubscriptionId being API 31 while minSdk is 26.
     lint {
         disable += "PermissionImpliesUnsupportedChromeOsHardware"
+        // QUERY_ALL_PACKAGES: lint's advice is "use <queries> instead". That was tried and
+        // measured NOT to work for queryBroadcastReceivers on Android 11 (see the manifest
+        // comment), and the rest of the objection is Google Play policy, which a sideloaded
+        // personal app is not subject to.
+        disable += "QueryAllPackagesPermission"
         abortOnError = true
     }
 

@@ -480,6 +480,28 @@ class MainActivity : Activity() {
                 root.addView(banner("未授予发短信权限，发信会失败。点此授权。") { requestSendSms() })
             }
         }
+        // Android 11+ quietly revokes the permissions of an app it decides is "unused" — and a
+        // background forwarder with no daily UI use looks exactly like one. This is what takes
+        // SEND_SMS (and with it the default-SMS role's grants) away days after they were set, i.e.
+        // the "过一会又没权限了". It was only reachable through the long-press 保活检查 sheet, which
+        // is no use when the person holding the phone is not the person who wrote the app: a
+        // banner on the first screen is the only version of this that actually gets found.
+        if (Build.VERSION.SDK_INT >= 30 &&
+            !runCatching { packageManager.isAutoRevokeWhitelisted }.getOrDefault(true)
+        ) {
+            root.addView(banner("系统会自动收回本应用权限（过一阵就发不了短信）。点此关闭。") {
+                runCatching {
+                    startActivity(
+                        Intent(
+                            Intent.ACTION_AUTO_REVOKE_PERMISSIONS,
+                            android.net.Uri.parse("package:$packageName"),
+                        )
+                    )
+                }.onFailure {
+                    Toast.makeText(this, "请到 设置→应用→验证码→权限 最底部关闭「未使用时移除权限」", Toast.LENGTH_LONG).show()
+                }
+            })
+        }
         val items = try { readRecentCodes(this) } catch (e: Exception) { emptyList() }
         if (items.isEmpty()) {
             root.addView(hint("最近没有短信。", tappable = false) {})
@@ -953,6 +975,18 @@ class MainActivity : Activity() {
             "转发服务：" + if (fgRunning) "运行中" else "未运行",
             if (fgRunning) muted else bad,
         ))
+        // Which packages the listener will accept an SMS notification from. Empty here means the
+        // manifest <queries> entry is missing or filtered, and every incoming SMS would be ignored
+        // while looking perfectly healthy everywhere else.
+        val smsApps = smsCapablePackages(this)
+        content.addView(statusLine(
+            if (smsApps.isEmpty()) "❌ 未发现任何系统短信应用（通知转发会失效）"
+            else "✅ 可读取通知的短信应用：" + smsApps.joinToString("、"),
+            if (smsApps.isEmpty()) bad else muted,
+        ))
+        val lastNotif = getSharedPreferences("dev", MODE_PRIVATE).getString("lastNotif", "").orEmpty()
+        content.addView(statusLine("上次通知：" + lastNotif.ifEmpty { "（无记录）" },
+            if (lastNotif.contains("已转发") || lastNotif.isEmpty()) muted else bad))
         content.addView(linkRow("本机短信测试（不经过网页/服务器）") { smsTestDialog() })
     }
 

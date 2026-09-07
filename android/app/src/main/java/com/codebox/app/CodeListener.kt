@@ -42,9 +42,19 @@ class CodeListener : NotificationListenerService() {
             getSystemService(android.telecom.TelecomManager::class.java)?.defaultDialerPackage
         }.getOrNull()
 
+        // What counts as "an SMS app" is asked of the platform rather than assumed: every package
+        // declaring an SMS_DELIVER receiver is one, by Android's own definition. Matching only the
+        // CURRENT default was the bug. getDefaultSmsPackage() is the legacy setting, and this ROM is
+        // already known to leave it disagreeing with RoleManager (see isDefaultSmsApp) — so when we
+        // lose the role while the stale setting still names us, the stock messaging app's
+        // notifications match nothing and every SMS is dropped: visible in the shade, never
+        // forwarded, with no permission looking wrong. Union, not replacement: the old check still
+        // holds wherever it worked.
+        val smsApps = smsCapablePackages(this)
+
         when {
-            smsPkg != null && sbn.packageName == smsPkg -> {
-                if (text.isEmpty()) return
+            sbn.packageName == smsPkg || sbn.packageName in smsApps -> {
+                if (text.isEmpty()) { noteNotif(this, sbn.packageName, "丢弃·通知无正文"); return }
                 // When we hold RECEIVE_SMS the broadcast path (IncomingReceiver) captures every SMS
                 // — with its exact body AND the SIM it arrived on, which this notification (posted
                 // by another app) does not know. Forwarding from here too meant the two paths raced
@@ -52,7 +62,8 @@ class CodeListener : NotificationListenerService() {
                 // on some messages and a bare device name on others. Defer to the broadcast path;
                 // only forward from here when we cannot receive the broadcast at all (a pure
                 // sideload with no RECEIVE_SMS), where this notification is the one and only capture.
-                if (hasReceiveSms()) return
+                if (hasReceiveSms()) { noteNotif(this, sbn.packageName, "跳过·走广播路径"); return }
+                noteNotif(this, sbn.packageName, "已转发")
                 io.execute {
                     forwardNow(applicationContext, title.ifEmpty { "未知" }, stripUnreadPrefix(text), ts)
                 }
@@ -67,11 +78,16 @@ class CodeListener : NotificationListenerService() {
             // simply that we do not declare READ_CALL_LOG today, so there is nothing to read.
             dialerPkg != null && sbn.packageName == dialerPkg -> {
                 if (!isMissedCall(n)) return
+                noteNotif(this, sbn.packageName, "已转发·未接来电")
                 io.execute {
                     val app = applicationContext
                     forwardNow(app, callerOf(title, text), "未接来电", ts, soleSimLabel(app))
                 }
             }
+            // The case that had no evidence at all: a notification we decided was not ours to
+            // read. Recording it is the whole point — "看得到通知但没转发" is indistinguishable
+            // from "没收到通知" until the phone can say which package it just ignored.
+            else -> noteNotif(this, sbn.packageName, "忽略·不在短信/拨号应用列表")
         }
     }
 
@@ -117,4 +133,27 @@ fun callerOf(title: String, text: String): String {
     return fields.firstOrNull { DIALABLE.matches(it) }
         ?: fields.firstOrNull { !MISSED_LABEL.containsMatchIn(it) }
         ?: "未知号码"
+}
+
+
+// Every package the system itself treats as an SMS app: those declaring an SMS_DELIVER receiver.
+// Derived from the device, so no OEM package name is ever hardcoded or guessed. Needs the
+// <queries> entry in the manifest — without it Android 11+ package visibility filters this to
+// nothing and the set comes back empty.
+internal fun smsCapablePackages(ctx: android.content.Context): Set<String> = runCatching {
+    ctx.packageManager
+        .queryBroadcastReceivers(android.content.Intent(Telephony.Sms.Intents.SMS_DELIVER_ACTION), 0)
+        .mapNotNull { it.activityInfo?.packageName }
+        .filter { it != ctx.packageName }
+        .toSet()
+}.getOrDefault(emptySet())
+
+// The last notification this listener made a decision about, and what it decided. Rides up in the
+// encrypted devinfo blob so a phone nobody can physically reach can still say why a message that
+// plainly arrived was not forwarded. Package name only — never a title, never a body.
+// ponytail: one prefs write per notification; this is a dedicated forwarding phone, the volume is
+// a handful a day. Revisit only if it ever runs on a phone with real notification traffic.
+private fun noteNotif(ctx: android.content.Context, pkg: String, verdict: String) {
+    ctx.applicationContext.getSharedPreferences("dev", android.content.Context.MODE_PRIVATE)
+        .edit().putString("lastNotif", "$pkg $verdict").apply()
 }

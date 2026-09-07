@@ -1529,7 +1529,7 @@ async function renderBeat(){
     next.set(d.id, {
       id: d.id, ts: d.ts, name: info?.n || ("设备 " + d.id.slice(0, 4)),
       sims: info?.s || [], caps: info?.c || null, gaps: info?.g || null, ver: info?.v || null, tr: info?.t || null, os: info?.os || null, ls: info?.ls || null,
-      cap: info?.cap || null, pp: info?.pp || null,
+      cap: info?.cap || null, pp: info?.pp || null, ln: info?.ln || null,
     });
   }
   DEVS = next;
@@ -1708,6 +1708,16 @@ async function renderBeat(){
       c.textContent = "发送条件 " + txt;
       c.title = c.textContent;
       sub.append(c);
+    }
+    // What the notification listener last did, and with which package. "通知栏看得到但没转发" and
+    // "根本没收到通知" look identical from here without it.
+    if (d.ln) {
+      const txt = String(d.ln);
+      const l = document.createElement("div");
+      l.className = txt.includes("已转发") ? "dev-sims" : "dev-warn";
+      l.textContent = "上次通知 " + txt;
+      l.title = l.textContent;
+      sub.append(l);
     }
     // Did the phone's poll reach the server, and which send task did it last pick up? This is what
     // separates "网页的命令没到手机" from "手机收到了但发不出去" — previously indistinguishable.

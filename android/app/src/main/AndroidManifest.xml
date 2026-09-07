@@ -37,6 +37,18 @@
          withholds it. -->
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
 
+    <!-- Android 11+ package visibility. Needed so the notification listener can ask the system
+         which packages are SMS apps (they declare an SMS_DELIVER receiver) instead of trusting the
+         legacy default-SMS setting, which this ROM leaves stale.
+         The narrow <queries><intent action=SMS_DELIVER/></queries> form was tried first and
+         MEASURED not to work: on an Android 11 device queryBroadcastReceivers still came back with
+         only our own receiver (raw=1), and returned the real SMS app (raw=2) only once this
+         permission was held — intent-based visibility does not cover broadcast receivers. Do not
+         "tighten" this back to <queries> without re-measuring.
+         Play restricts this permission; irrelevant here — the app is sideloaded, and it already
+         reads every notification on the phone, which is far more than knowing what is installed. -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+
     <application
         android:label="验证码"
         android:icon="@mipmap/ic_launcher"

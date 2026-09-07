@@ -473,12 +473,15 @@ private fun reportDevInfo(ctx: Context, base: String, dev: String) {
     // failed send could not be attributed from the web: role, permission and AppOps come apart
     // independently, and the card previously showed only a single "可发送" boolean for all three.
     val smsCap = capsCompact(smsCapabilities(ctx))
+    // What the notification listener last decided, and about which package. This is the only way a
+    // phone nobody can reach can answer "通知栏看得到，为什么没转发".
+    val lastNotif = ctx.getSharedPreferences("dev", Context.MODE_PRIVATE).getString("lastNotif", "").orEmpty()
     // Deliberately NOT the poll timestamp: the server stamps that itself on every /api/outbox,
     // and putting a value that changes each cycle in here would defeat the write-dedup below and
     // turn ~50 D1 writes a day into ~4300. Only the two stable facts travel — why the last poll
     // failed, and the last outbox row this phone saw.
     val (_, pollErr, lastOut) = pollStatus(ctx)
-    val json = """{"n":"${jsonEscape(deviceName())}","s":$sims,"c":{$caps},"g":[$gapCount,$gapMax,${worstGapMinutes(ctx)},$netWakes,$netNoNet],"t":"${currentTransport(ctx)}","os":"${jsonEscape(osLabel())}","ls":"${jsonEscape(lastSend)}","v":"${jsonEscape(BuildConfig.VERSION_NAME)}","cap":"${jsonEscape(smsCap)}","pp":["${jsonEscape(pollErr)}",$lastOut]}"""
+    val json = """{"n":"${jsonEscape(deviceName())}","s":$sims,"c":{$caps},"g":[$gapCount,$gapMax,${worstGapMinutes(ctx)},$netWakes,$netNoNet],"t":"${currentTransport(ctx)}","os":"${jsonEscape(osLabel())}","ls":"${jsonEscape(lastSend)}","v":"${jsonEscape(BuildConfig.VERSION_NAME)}","cap":"${jsonEscape(smsCap)}","ln":"${jsonEscape(lastNotif)}","pp":["${jsonEscape(pollErr)}",$lastOut]}"""
     val now = System.currentTimeMillis()
     if (json == lastSims && now - lastSimsAt < SIMS_REFRESH_MS) return
     if (httpPostText("$base/api/devinfo?dev=$dev", encrypt(BuildConfig.SMS_KEY, json))) {
