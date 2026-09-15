@@ -1,0 +1,33 @@
+-- config.lua.example — 复制成 config.lua 填好，和 main.lua / gw.lua / gcm.lua 一起刷进模组
+-- （pack.sh 会把这 4 个文件打成给卖家的 zip）。config.lua 在根 .gitignore 里，不会被提交。
+--
+-- 只有 SMS_KEY 是必填的；其余不写就用 main.lua 里的默认值。合并顺序：
+--   main.lua 的 DEFAULTS ← config.lua ← fskv "bases"（网页「改域名」/ 短信 #url 写入，后者优先）。
+-- 没有 config.lua、或 SMS_KEY 不是 64 位十六进制 / 全 0：模组什么都不做，只每 60 秒打一条日志。
+return {
+  -- AES-256-GCM 密钥，64 位十六进制（32 字节），与安卓 app / 网页端共用（cat worker/.sms_key）。
+  -- 卖家刷机时看得见这串（已接受）；丢了已存消息就永远解不开 —— 存进密码管理器。
+  SMS_KEY = "PASTE_64_HEX_FROM_worker/.sms_key",
+
+  -- 可选。Worker 的域名列表（字符串逗号分隔或表），按顺序尝试；都指向同一个 Worker/D1。
+  -- 这里允许 http://（本地测试用）；网页「改域名」和短信 #url 只收 https://。
+  -- BASES = { "https://777310753.xyz", "https://20150411.xyz" },
+
+  -- 可选。必须和 worker/wrangler.toml 里的 TOPIC 完全一致，否则上报返回 404（永久丢弃）。
+  -- TOPIC = "sms-7f3a9c2b1e0d",
+
+  -- 可选。网页设备卡片上显示的名字。
+  -- NAME = "Air780EHV",
+
+  -- 可选。轮询 /api/poll 的间隔（毫秒）。网页"在线"判定是 20 分钟，30 秒足够。
+  -- POLL_MS = 30000,
+
+  -- 可选。服务器 CA 证书（PEM 字符串）。nil = 不校验证书（默认；正文本身是端到端加密的）。
+  -- 如需校验：把 Cloudflare 当前签发链的 CA（如 GTS WE1 + GTS Root R4）拼成一个多证书 PEM 放这里。
+  -- CA_PEM = nil,
+
+  -- 可选。主人手机号：填了才启用短信指令（#status #reboot #url #ota），只认这个号发来的、
+  -- 以 # 开头的短信（比较末 11 位，带不带 +86 都行）。不填 = 所有短信（含 #…）一律当普通消息转发。
+  -- 平时用不着：重启 / 改域名 / 更新脚本都在网页上点。
+  -- OWNER = "+8613800138000",
+}

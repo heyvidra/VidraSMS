@@ -47,9 +47,17 @@ CREATE TABLE IF NOT EXISTS meta (
 -- device's own name and SIM carriers are PII, so the server stores it opaque, exactly like a
 -- message body. The id itself is a random opaque string with no meaning to the server.
 CREATE TABLE IF NOT EXISTS devices (
-  id   TEXT PRIMARY KEY,
-  ts   INTEGER NOT NULL,
-  info TEXT
+  id     TEXT PRIMARY KEY,
+  ts     INTEGER NOT NULL,
+  info   TEXT,
+  -- Self-registering modules (Air780EHV) present their own bearer secret; only sha256(secret) is
+  -- kept, so a D1 dump never yields a usable credential. Phones use the global SEND_TOKEN and
+  -- have auth NULL. Both columns are ALTER-added to the live DB by setup.sh; they must be here
+  -- too or a fresh setup silently lacks them and /api/register 500s.
+  auth   TEXT,
+  -- pending | trusted | blocked. A module starts 'pending' and may only publish/poll once the
+  -- web trusts it; phones default to 'trusted' and the legacy token ignores this column anyway.
+  status TEXT    NOT NULL DEFAULT 'trusted'
 );
 
 -- Web deletes that must be mirrored onto the phones. When a message is deleted on the web, its
@@ -61,3 +69,20 @@ CREATE TABLE IF NOT EXISTS deletions (
   ts      INTEGER NOT NULL,
   payload TEXT    NOT NULL   -- the deleted message's encrypted body (v1:...)
 );
+
+-- Web → module commands, picked up on the module's normal poll (one pending per device). The
+-- payload is plaintext JSON on purpose: {"type":"reboot"} | {"type":"ota","name":"gw","hmac":..}
+-- | {"type":"bases","value":"https://a,https://b"} — none of it is PII, and the server needs to
+-- read nothing from it. An OTA script itself is signed in the browser with SMS_KEY (the hmac),
+-- which the server never holds, so a compromised Worker cannot push code to a module.
+CREATE TABLE IF NOT EXISTS cmds (
+  id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts      INTEGER NOT NULL,
+  dev     TEXT    NOT NULL,
+  payload TEXT    NOT NULL,
+  status  TEXT    NOT NULL DEFAULT 'pending',   -- pending | done | failed
+  detail  TEXT
+);
+
+-- Every poll asks "is there a pending cmd for me", and /api/cmd asks the same before inserting.
+CREATE INDEX IF NOT EXISTS idx_cmds_dev_status ON cmds (dev, status);

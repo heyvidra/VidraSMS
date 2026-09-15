@@ -1,5 +1,7 @@
 # Secrets & local machine config — never commit
 android/local.properties
+luatos/config.lua
+luatos/dist/
 
 # Android build output
 android/.gradle/
@@ -18,3 +20,6 @@ worker/node_modules/
 # Android release signing — never commit these
 android/release.keystore
 android/keystore.properties
+
+# macOS
+.DS_Store

@@ -66,6 +66,83 @@ async function sessionValid(request, env) {
 
 const COOKIE_FLAGS = `Path=/; HttpOnly; Secure; SameSite=Strict`;
 
+/* -------------------------------------------------------------- device auth */
+
+async function sha256hex(s) {
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+  return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Who is this device? Two credentials coexist on the same routes:
+//   - the phones' shared SEND_TOKEN → { dev, legacy: true }. dev may be empty (an old build that
+//     never sent ?dev=), exactly as before — nothing about the phone path changes here.
+//   - a module's own secret → { dev, status }. Modules are looked up by ?dev= and verified as
+//     sha256(bearer) against devices.auth, so a D1 dump never contains a credential that works.
+//   - anything else → null. Callers answer with whatever they answered before (403 / 401), so a
+//     phone with a wrong token sees byte-for-byte what it always saw.
+// The hash is compared with safeEqual like the token itself: not because a hash comparison leaks
+// much, but because one code path for both means one thing to get right.
+async function deviceAuth(request, env, url) {
+  const auth = request.headers.get("Authorization") || "";
+  if (!auth.startsWith("Bearer ")) return null;
+  const bearer = auth.slice(7);
+  const dev = (url.searchParams.get("dev") || "").slice(0, 64);
+  if (env.SEND_TOKEN && safeEqual(bearer, env.SEND_TOKEN)) return { dev, legacy: true };
+  if (!dev || !bearer) return null;
+  // The two columns arrive with setup.sh's ALTERs. If the code got deployed a step ahead of the
+  // migration, a module simply cannot authenticate yet — and a phone with a wrong token must see
+  // the 403/401 it always saw, not a 500 about a missing column.
+  let row;
+  try {
+    row = await env.DB.prepare("SELECT auth, status, ts FROM devices WHERE id = ?").bind(dev).first();
+  } catch { return null; }
+  if (!row || !row.auth) return null;
+  if (!safeEqual(await sha256hex(bearer), row.auth)) return null;
+  return { dev, status: row.status, ts: Number(row.ts) || 0 };
+}
+
+// A device that authenticated but may not act: a module the web has not trusted yet (or has
+// blocked). Phones are never gated — the legacy token predates the status column.
+const deviceAllowed = (a) => !!a && (a.legacy || a.status === "trusted");
+
+// How often an untrusted module's heartbeat is written. Its credential is self-issued, so anyone
+// holding a pending row could otherwise turn a request loop into a billable D1 write loop.
+const UNTRUSTED_BEAT_MS = 60_000;
+
+// The poll batch shared by the phones' /api/outbox and the modules' /api/poll. Four statements,
+// in this order, run atomically:
+//  1. stamp last-seen (the web reads it to know the device is alive; no dev → the pre-device-id
+//     single heartbeat, which the page still shows for old builds);
+//  2. fail out rows claimed MAX_CLAIMS times that never came back acked — the device plainly
+//     can't submit them (weak signal / lost acks) and they must not cycle forever;
+//  3. give back claims stuck past the timeout so the next poll retries them. The window is
+//     generous — a real send waits up to 60s for its delivery result — so a live device is never
+//     second-guessed;
+//  4. claim-on-read: flip pending → sending and RETURN those rows, so a lost ack after a real
+//     send can't get the SMS sent twice. A row addressed to a device is only ever claimed by that
+//     device; dev IS NULL means "any", which a single-phone setup keeps producing.
+// Returns the statements so a caller can append its own to the same batch.
+function pollStatements(env, dev, now) {
+  const stamp = dev
+    ? env.DB.prepare("INSERT INTO devices (id, ts) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET ts=excluded.ts").bind(dev, now)
+    : env.DB.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('beat', ?)").bind(String(now));
+  const failout = env.DB.prepare(
+    "UPDATE outbox SET status='failed', detail='多次尝试未送达（弱信号或网络问题）' " +
+    "WHERE status='sending' AND ts <= ? AND claims >= ?"
+  ).bind(now - CLAIM_TIMEOUT_MS, MAX_CLAIMS);
+  const stale = env.DB.prepare(
+    "UPDATE outbox SET status='pending' WHERE status='sending' AND ts <= ? AND claims < ?"
+  ).bind(now - CLAIM_TIMEOUT_MS, MAX_CLAIMS);
+  const claim = env.DB.prepare(
+    "UPDATE outbox SET status='sending', claims=claims+1 WHERE status='pending' AND (dev IS NULL OR dev = ?) RETURNING id, payload"
+  ).bind(dev);
+  return [stamp, failout, stale, claim];
+}
+
+const OTA_NAMES = new Set(["gw", "gcm"]);
+const CMD_TYPES = new Set(["reboot", "ota", "bases"]);
+const DEV_STATUSES = new Set(["pending", "trusted", "blocked"]);
+
 /* --------------------------------------------------------------- web push */
 
 // Data-less Web Push: the server only holds ciphertext, so a push can't carry the code —
@@ -136,8 +213,10 @@ async function handlePublish(request, env, topic, ctx) {
   if (!env.SEND_TOKEN) return new Response("server not configured", { status: 500 });
   if (topic !== env.TOPIC) return new Response("unknown topic", { status: 404 });
 
-  const auth = request.headers.get("Authorization") || "";
-  if (!auth.startsWith("Bearer ") || !safeEqual(auth.slice(7), env.SEND_TOKEN)) {
+  // Phones (SEND_TOKEN) or a trusted module (its own secret). A module the web has not trusted
+  // gets the same 403 as a bad token: the device keeps the message queued and retries later.
+  const u = new URL(request.url);
+  if (!deviceAllowed(await deviceAuth(request, env, u))) {
     return new Response("forbidden", { status: 403 });
   }
 
@@ -147,7 +226,6 @@ async function handlePublish(request, env, topic, ctx) {
   // A backfill (the app re-forwarding the phone's existing inbox) arrives with quiet=1 and the
   // message's ORIGINAL time: stored like any other row, but no push — 50 old messages must not
   // become 50 notifications — and timestamped when it really arrived, not when it was re-sent.
-  const u = new URL(request.url);
   const quiet = u.searchParams.get("quiet") === "1";
   const tsParam = Number(u.searchParams.get("ts") || 0);
   const ts = (quiet && tsParam > 1e12 && tsParam <= Date.now() + 60_000) ? tsParam : Date.now();
@@ -349,53 +427,20 @@ export default {
     //  2. claim-on-read: flip pending -> sending and RETURN those rows, so if the phone's ack is
     //     lost after a real send, the row is no longer 'pending' and won't be sent a second time.
     if (isRead && path === "/api/outbox") {
-      const auth = request.headers.get("Authorization") || "";
-      if (!env.SEND_TOKEN || !auth.startsWith("Bearer ") || !safeEqual(auth.slice(7), env.SEND_TOKEN)) {
-        return new Response("forbidden", { status: 403 });
-      }
+      const a = await deviceAuth(request, env, url);
+      if (!deviceAllowed(a)) return new Response("forbidden", { status: 403 });
       // ?dev= identifies which phone is polling. Everything is keyed on it now, because with two
       // phones sharing one token a single heartbeat hid which one had died, and a send meant for
       // one could be claimed and sent by the other, off the wrong SIM.
-      const dev = (url.searchParams.get("dev") || "").slice(0, 64);
-      const now = Date.now();
-      const stamp = dev
-        ? env.DB.prepare("INSERT INTO devices (id, ts) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET ts=excluded.ts").bind(dev, now)
-        : env.DB.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('beat', ?)").bind(String(now));
-      // A claim that is never acked used to be terminal: the phone dies (or the response never
-      // reaches it) right after the row flips to 'sending', and since nothing ever writes it back
-      // the SMS is silently never sent. Rows stuck 'sending' past the timeout are returned to
-      // 'pending' so the next poll picks them up. The window is generous — a real send waits up
-      // to 60s for its delivery result — so a live phone is never second-guessed.
-      // A claim stuck past the timeout: give it back to be retried — UNLESS it has already been
-      // claimed MAX_CLAIMS times without ever acking, in which case the phone plainly can't submit
-      // it (weak signal / lost acks) and it becomes 'failed' rather than cycling forever.
-      const failout = env.DB.prepare(
-        "UPDATE outbox SET status='failed', detail='多次尝试未送达（弱信号或网络问题）' " +
-        "WHERE status='sending' AND ts <= ? AND claims >= ?"
-      ).bind(now - CLAIM_TIMEOUT_MS, MAX_CLAIMS);
-      const stale = env.DB.prepare(
-        "UPDATE outbox SET status='pending' WHERE status='sending' AND ts <= ? AND claims < ?"
-      ).bind(now - CLAIM_TIMEOUT_MS, MAX_CLAIMS);
-      // A row addressed to a specific device is only ever claimed by that device; dev IS NULL
-      // means "any phone", which is what a single-phone setup keeps producing. Each claim bumps
-      // the counter that feeds the fail-out above.
-      const claimSql = "UPDATE outbox SET status='sending', claims=claims+1 WHERE status='pending' AND (dev IS NULL OR dev = ?) RETURNING id, payload";
-      const [, , , claim] = await env.DB.batch([
-        stamp,
-        failout,
-        stale,
-        env.DB.prepare(claimSql).bind(dev),
-      ]);
+      const [, , , claim] = await env.DB.batch(pollStatements(env, a.dev, Date.now()));
       return Response.json(claim.results || []);
     }
     // Phone reports its name + SIM list, encrypted: both are PII, so the server keeps it opaque
     // and only the browser can read it. Per device, so two phones stop overwriting each other.
     if (request.method === "POST" && path === "/api/devinfo") {
-      const auth = request.headers.get("Authorization") || "";
-      if (!env.SEND_TOKEN || !auth.startsWith("Bearer ") || !safeEqual(auth.slice(7), env.SEND_TOKEN)) {
-        return new Response("forbidden", { status: 403 });
-      }
-      const dev = (url.searchParams.get("dev") || "").slice(0, 64);
+      const a = await deviceAuth(request, env, url);
+      if (!deviceAllowed(a)) return new Response("forbidden", { status: 403 });
+      const dev = a.dev;
       if (!dev) return new Response('{"error":"bad"}', { status: 400 });
       const info = (await request.text()).slice(0, 4096);
       await env.DB.prepare(
@@ -403,12 +448,22 @@ export default {
       ).bind(dev, Date.now(), info).run();
       return Response.json({ ok: true });
     }
-    // Web polls this for the per-device liveness list.
+    // Web polls this for the per-device liveness list. `module` (has its own secret) is what lets
+    // the page offer 信任/拉黑 and commands only where they mean something — on a phone, status
+    // is ignored by the token path and a command would never be picked up.
     if (isRead && path === "/api/status") {
       if (!(await sessionValid(request, env))) {
         return new Response('{"error":"unauthorized"}', { status: 401, headers: { "Content-Type": "application/json" } });
       }
-      const { results } = await env.DB.prepare("SELECT id, ts, info FROM devices ORDER BY ts DESC").all();
+      let results;
+      try {
+        ({ results } = await env.DB.prepare(
+          "SELECT id, ts, info, status, (auth IS NOT NULL) AS module FROM devices ORDER BY ts DESC"
+        ).all());
+      } catch {
+        // Code deployed ahead of setup.sh's ALTERs: the phones' strip must not go blank for that.
+        ({ results } = await env.DB.prepare("SELECT id, ts, info FROM devices ORDER BY ts DESC").all());
+      }
       const legacy = await env.DB.prepare("SELECT v FROM meta WHERE k='beat'").first();
       return Response.json({ devices: results || [], beat: legacy ? Number(legacy.v) : 0 });
     }
@@ -425,16 +480,237 @@ export default {
     }
     // Phone reports the result of a send.
     if (request.method === "POST" && path === "/api/outbox/ack") {
-      const auth = request.headers.get("Authorization") || "";
-      if (!env.SEND_TOKEN || !auth.startsWith("Bearer ") || !safeEqual(auth.slice(7), env.SEND_TOKEN)) {
-        return new Response("forbidden", { status: 403 });
-      }
+      const a = await deviceAuth(request, env, url);
+      if (!deviceAllowed(a)) return new Response("forbidden", { status: 403 });
       const b = await request.json().catch(() => null);
       const id = Number(b?.id);
       if (!Number.isInteger(id)) return new Response('{"error":"bad"}', { status: 400 });
-      await env.DB.prepare("UPDATE outbox SET status=?, detail=? WHERE id=?")
-        .bind(b.ok ? "sent" : "failed", (b.detail || "").slice(0, 200), id).run();
+      const st = b.ok ? "sent" : "failed", detail = (b.detail || "").slice(0, 200);
+      // Phones share one token and are all the owner's, so their ack has never been scoped and
+      // stays that way. A module has an identity of its own: it may only close rows it could
+      // have claimed — its own or the unaddressed ones — never another device's.
+      const upd = a.legacy
+        ? env.DB.prepare("UPDATE outbox SET status=?, detail=? WHERE id=?").bind(st, detail, id)
+        : env.DB.prepare("UPDATE outbox SET status=?, detail=? WHERE id=? AND (dev IS NULL OR dev = ?)").bind(st, detail, id, a.dev);
+      await upd.run();
       return Response.json({ ok: true });
+    }
+
+    // --- self-registering modules (Air780EHV) ------------------------------------------
+    // A module has no operator to type a token into it. At first boot it makes its own secret,
+    // registers here with everything it knows about itself (encrypted, like devinfo), and shows
+    // up on the web as 待信任. Until someone clicks 信任 it can neither publish nor claim sends;
+    // it just keeps re-registering and polling, so the answer to "is it trusted yet" is always
+    // one poll away. No TOFU, no shared token: the phone's SEND_TOKEN is never on a module.
+    if (request.method === "POST" && path === "/api/register") {
+      const auth = request.headers.get("Authorization") || "";
+      if (!auth.startsWith("Bearer ") || auth.length <= 7) return new Response("forbidden", { status: 403 });
+      const dev = url.searchParams.get("dev") || "";
+      if (!/^[0-9a-f]{16,64}$/.test(dev)) return new Response('{"error":"bad"}', { status: 400 });
+      // The secret is the module's only credential for everything it will ever do here, so a weak
+      // one (a buggy or copycat firmware registering with "a") must not become permanent. Part B
+      // mints 32 hex from the TRNG; anything else is a client bug, not an auth failure.
+      if (!/^[0-9a-f]{32,128}$/i.test(auth.slice(7))) return new Response('{"error":"bad"}', { status: 400 });
+      // The blob is a few hundred bytes of ciphertext and a truncated one decrypts to nothing, so
+      // an oversized body is refused — before it is read, like every other refusal below: nothing
+      // here buffers a body for a request that is about to be turned away.
+      if (Number(request.headers.get("Content-Length") || 0) > 4096) return new Response('{"error":"too large"}', { status: 413 });
+      const h = await sha256hex(auth.slice(7));
+      const now = Date.now();
+      const readInfo = async () => (await request.text()).slice(0, 4096) || null;
+      const row = await env.DB.prepare("SELECT auth, status, ts FROM devices WHERE id = ?").bind(dev).first();
+      if (!row) {
+        // Anyone who knows the URL can register (that is the point — nothing to configure), so
+        // cap the unreviewed pile: past this a stranger's spam just gets 429 until the web tidies.
+        const c = await env.DB.prepare("SELECT count(*) AS n FROM devices WHERE status='pending'").first();
+        if ((c?.n || 0) >= 20) return new Response("too many pending devices", { status: 429 });
+        await env.DB.prepare("INSERT INTO devices (id, ts, info, auth, status) VALUES (?, ?, ?, ?, 'pending')")
+          .bind(dev, now, await readInfo(), h).run();
+        return Response.json({ status: "pending" });
+      }
+      // A phone's id (no secret) can't be taken over by a module claiming the same id.
+      if (!row.auth) return new Response('{"error":"conflict"}', { status: 409 });
+      if (!safeEqual(h, row.auth)) return new Response("forbidden", { status: 403 });
+      // Re-registration (every boot and every 30 min): refresh the self-description, and count it
+      // as a heartbeat. Status is the web's to set, never the device's. A blocked module gets its
+      // answer and nothing else; a pending one is written at most once a minute — both hold a
+      // credential nobody has vetted, and neither may drive D1 writes at will.
+      if (row.status === "blocked") return Response.json({ status: "blocked" });
+      if (row.status === "trusted" || now - (Number(row.ts) || 0) >= UNTRUSTED_BEAT_MS) {
+        await env.DB.prepare("UPDATE devices SET info=?, ts=? WHERE id=?").bind(await readInfo(), now, dev).run();
+      }
+      return Response.json({ status: row.status });
+    }
+    // The module's poll: /api/outbox plus the command channel, in one round trip. GET only —
+    // a HEAD would claim rows and drop them. The legacy token is refused on purpose: phones
+    // have /api/outbox, and a token that is on every phone must not be able to pick up commands
+    // meant for a specific module.
+    if (request.method === "GET" && path === "/api/poll") {
+      const a = await deviceAuth(request, env, url);
+      if (!a || a.legacy) return new Response("forbidden", { status: 403 });
+      const now = Date.now();
+      if (a.status !== "trusted") {
+        // Still a heartbeat — the web shows "last seen" on a pending card so you can tell the
+        // module you just powered on from one that registered last week — but no claim, no cmd,
+        // at most one write a minute (the credential is self-issued), and none once blocked.
+        if (a.status === "pending" && now - a.ts >= UNTRUSTED_BEAT_MS) {
+          await env.DB.prepare("UPDATE devices SET ts=? WHERE id=?").bind(now, a.dev).run();
+        }
+        return Response.json({ status: a.status });
+      }
+      const cmdSel = env.DB.prepare(
+        "SELECT id, payload FROM cmds WHERE dev=? AND status='pending' ORDER BY id LIMIT 1"
+      ).bind(a.dev);
+      const [, , , claim, cmds] = await env.DB.batch([...pollStatements(env, a.dev, now), cmdSel]);
+      let cmd = null;
+      const c = cmds.results?.[0];
+      if (c) { try { cmd = Object.assign({ id: c.id }, JSON.parse(c.payload)); } catch {} }
+      return Response.json({ status: "trusted", rows: claim.results || [], cmd });
+    }
+    // Module reports how a command went. Scoped to its own dev so one module can't close
+    // another's command.
+    if (request.method === "POST" && path === "/api/cmd/ack") {
+      const a = await deviceAuth(request, env, url);
+      if (!a || a.legacy || a.status !== "trusted") return new Response("forbidden", { status: 403 });
+      const b = await request.json().catch(() => null);
+      const id = Number(b?.id);
+      if (!Number.isInteger(id)) return new Response('{"error":"bad"}', { status: 400 });
+      await env.DB.prepare("UPDATE cmds SET status=?, detail=? WHERE id=? AND dev=?")
+        .bind(b.ok ? "done" : "failed", String(b.detail || "").slice(0, 200), id, a.dev).run();
+      return Response.json({ ok: true });
+    }
+    // The script an OTA command points at. Plain bytes, no signature here: the module checks
+    // HMAC-SHA256 under SMS_KEY against cmd.hmac, which the browser computed — the server never
+    // had the key and so can never hand a module code the owner did not sign.
+    if (request.method === "GET" && path === "/api/ota/get") {
+      const a = await deviceAuth(request, env, url);
+      if (!a || a.legacy || a.status !== "trusted") return new Response("forbidden", { status: 403 });
+      const name = url.searchParams.get("name") || "";
+      if (!OTA_NAMES.has(name)) return new Response('{"error":"bad"}', { status: 400 });
+      const bytes = await env.APK?.get("ota:" + name, "arrayBuffer");
+      if (!bytes) return new Response("not found", { status: 404 });
+      return new Response(bytes, {
+        headers: {
+          "Content-Type": "text/plain; charset=utf-8",
+          "Content-Length": String(bytes.byteLength),
+          "Cache-Control": "no-cache",
+        },
+      });
+    }
+
+    // --- web side of the module registry (cookie session) -------------------------------
+    if (request.method === "POST" && path === "/api/device/trust") {
+      if (!(await sessionValid(request, env))) {
+        return new Response('{"error":"unauthorized"}', { status: 401, headers: { "Content-Type": "application/json" } });
+      }
+      const b = await request.json().catch(() => null);
+      if (!b?.id || !DEV_STATUSES.has(b.status)) return new Response('{"error":"bad"}', { status: 400 });
+      await env.DB.prepare("UPDATE devices SET status=? WHERE id=?").bind(b.status, String(b.id).slice(0, 64)).run();
+      return Response.json({ ok: true });
+    }
+    // Queue a command for a module. One pending per device: a module runs a command and reboots,
+    // so a second one queued behind it would run against a state nobody looked at.
+    if (request.method === "POST" && path === "/api/cmd") {
+      if (!(await sessionValid(request, env))) {
+        return new Response('{"error":"unauthorized"}', { status: 401, headers: { "Content-Type": "application/json" } });
+      }
+      const b = await request.json().catch(() => null);
+      const dev = typeof b?.dev === "string" ? b.dev.slice(0, 64) : "";
+      if (!dev || !CMD_TYPES.has(b.type)) return new Response('{"error":"bad"}', { status: 400 });
+      const payload = { type: b.type };
+      if (b.type === "ota") {
+        if (!OTA_NAMES.has(b.name) || !/^[0-9a-f]{64}$/i.test(String(b.hmac || ""))) {
+          return new Response('{"error":"bad"}', { status: 400 });
+        }
+        payload.name = b.name; payload.hmac = String(b.hmac).toLowerCase();
+      } else if (b.type === "bases") {
+        // The module will only ever talk to these, so a typo here bricks it until an SMS command
+        // (if OWNER is set) or a reflash — validate hard. The normalised list is what gets stored.
+        // The module appends "/api/…" to each entry, so nothing that would swallow that — a query,
+        // a fragment, quotes, escapes — may ride along, and a trailing "/" is dropped so the join
+        // is well-formed. The page's 改域名 prompt applies the same rule before asking.
+        //
+        // Signed like "ota", and for a stronger reason: `bases` moves the module to another
+        // server for good, so an unsigned one lets an on-path attacker (TLS verification is off
+        // by default) or a compromised Worker capture it permanently — block/forget would never
+        // reach it again. The browser MACs "bases\n" + the normalised value under SMS_KEY, which
+        // this server never holds: it can neither verify the signature nor forge one. It only
+        // insists one is present and carries it to the module, which checks it against the value
+        // exactly as stored. The normalisation below is the same rule the page already applied,
+        // so on a page-sent value it is a no-op and what is stored is what was signed.
+        if (!/^[0-9a-f]{64}$/i.test(String(b.hmac || ""))) {
+          return new Response('{"error":"bad"}', { status: 400 });
+        }
+        const list = String(b.value || "").split(",").map((s) => s.trim().replace(/\/+$/, "")).filter(Boolean);
+        const okUrl = (s) => s.length <= 120 && /^https:\/\/[A-Za-z0-9.-]+(:[0-9]+)?(\/[A-Za-z0-9._~\/-]*)?$/.test(s);
+        if (!list.length || list.length > 5 || !list.every(okUrl)) {
+          return new Response('{"error":"bad"}', { status: 400 });
+        }
+        payload.value = list.join(",");
+        payload.hmac = String(b.hmac).toLowerCase();
+      }
+      // Only a module can pick a command up; refusing for phones keeps a stray click from parking
+      // a row that would show "待执行" forever.
+      const row = await env.DB.prepare("SELECT auth FROM devices WHERE id = ?").bind(dev).first();
+      if (!row?.auth) return new Response('{"error":"nodev"}', { status: 404 });
+      const pend = await env.DB.prepare("SELECT id FROM cmds WHERE dev=? AND status='pending' LIMIT 1").bind(dev).first();
+      if (pend) return new Response('{"error":"pending"}', { status: 409, headers: { "Content-Type": "application/json" } });
+      const r = await env.DB.prepare("INSERT INTO cmds (ts, dev, payload) VALUES (?, ?, ?)")
+        .bind(Date.now(), dev, JSON.stringify(payload)).run();
+      return Response.json({ ok: true, id: r.meta?.last_row_id });
+    }
+    if (isRead && path === "/api/cmd/list") {
+      if (!(await sessionValid(request, env))) {
+        return new Response('{"error":"unauthorized"}', { status: 401, headers: { "Content-Type": "application/json" } });
+      }
+      const dev = (url.searchParams.get("dev") || "").slice(0, 64);
+      const { results } = await env.DB.prepare(
+        "SELECT id, ts, payload, status, detail FROM cmds WHERE dev=? ORDER BY id DESC LIMIT 20"
+      ).bind(dev).all();
+      return Response.json(results || []);
+    }
+    // Withdraw a command the module has not picked up yet. A done/failed row is history and stays.
+    if (request.method === "DELETE" && path.startsWith("/api/cmd/")) {
+      if (!(await sessionValid(request, env))) {
+        return new Response('{"error":"unauthorized"}', { status: 401, headers: { "Content-Type": "application/json" } });
+      }
+      const id = Number(path.slice("/api/cmd/".length));   // an integer: nothing to decode, and "%" must not throw
+      if (!Number.isInteger(id)) return new Response('{"error":"bad"}', { status: 400 });
+      const r = await env.DB.prepare("DELETE FROM cmds WHERE id=? AND status='pending'").bind(id).run();
+      return Response.json({ ok: true, deleted: r.meta?.changes || 0 });
+    }
+    // Stage a script for OTA. Stored as-is in KV; the signature travels in the cmd, not here,
+    // because it is made in the browser with the key the server never holds. The Lua sniff is
+    // only there to catch uploading the wrong file (a .soc, a zip) — it is not a security check.
+    if (request.method === "POST" && path === "/api/ota/put") {
+      if (!(await sessionValid(request, env))) {
+        return new Response('{"error":"unauthorized"}', { status: 401, headers: { "Content-Type": "application/json" } });
+      }
+      const name = url.searchParams.get("name") || "";
+      if (!OTA_NAMES.has(name)) return new Response('{"error":"bad"}', { status: 400 });
+      if (Number(request.headers.get("Content-Length") || 0) > 200_000) return new Response('{"error":"too large"}', { status: 413 });
+      const bytes = await request.arrayBuffer();
+      if (bytes.byteLength > 200_000) return new Response('{"error":"too large"}', { status: 413 });
+      const text = new TextDecoder().decode(bytes);
+      const looksLua = text.includes("return M") || /^\s*(--|local\b)/.test(text);
+      if (!bytes.byteLength || !looksLua) return new Response('{"error":"not lua"}', { status: 400 });
+      const sha256 = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))]
+        .map((b) => b.toString(16).padStart(2, "0")).join("");
+      const meta = { size: bytes.byteLength, ts: Date.now(), sha256 };
+      await env.APK.put("ota:" + name, bytes);
+      await env.APK.put("ota:" + name + ":meta", JSON.stringify(meta));
+      return Response.json({ ok: true, size: meta.size, sha256 });
+    }
+    if (isRead && path === "/api/ota/meta") {
+      if (!(await sessionValid(request, env))) {
+        return new Response('{"error":"unauthorized"}', { status: 401, headers: { "Content-Type": "application/json" } });
+      }
+      const out = {};
+      for (const n of OTA_NAMES) {
+        const m = await env.APK?.get("ota:" + n + ":meta");
+        out[n] = m ? JSON.parse(m) : null;
+      }
+      return Response.json(out);
     }
 
 
@@ -488,10 +764,11 @@ export default {
     //   GET /api/app?meta=1 -> {"code":<versionCode>,"name":"<versionName>"} (set by upload-apk.sh)
     //   GET /api/app        -> the APK bytes
     if (path === "/api/app") {
-      const auth = request.headers.get("Authorization") || "";
-      if (!env.SEND_TOKEN || !auth.startsWith("Bearer ") || !safeEqual(auth.slice(7), env.SEND_TOKEN)) {
+      const a = await deviceAuth(request, env, url);
+      if (!a) {
         return new Response('{"error":"unauthorized"}', { status: 401, headers: { "Content-Type": "application/json" } });
       }
+      if (!deviceAllowed(a)) return new Response("forbidden", { status: 403 });
       if (new URL(request.url).searchParams.get("meta")) {
         const meta = await env.APK?.get("appmeta");
         return new Response(meta || '{"code":0,"name":""}', { headers: { "Content-Type": "application/json" } });
@@ -510,10 +787,11 @@ export default {
     // Deletions the phone must mirror into its own SMS database. The phone reads rows past the
     // high-water mark it stored, decrypts each payload, and deletes the matching local SMS.
     if (path === "/api/deletions") {
-      const auth = request.headers.get("Authorization") || "";
-      if (!env.SEND_TOKEN || !auth.startsWith("Bearer ") || !safeEqual(auth.slice(7), env.SEND_TOKEN)) {
+      const a = await deviceAuth(request, env, url);
+      if (!a) {
         return new Response('{"error":"unauthorized"}', { status: 401, headers: { "Content-Type": "application/json" } });
       }
+      if (!deviceAllowed(a)) return new Response("forbidden", { status: 403 });
       const since = Number(new URL(request.url).searchParams.get("since") || "0") || 0;
       const rows = await env.DB.prepare(
         "SELECT id, payload FROM deletions WHERE id > ? ORDER BY id LIMIT 500"
@@ -957,6 +1235,26 @@ li.fresh{background:var(--fresh);border-color:var(--fresh-line)}
    wraps instead of ellipsising, and the card widens a little to give it room. */
 .dev-warn{color:var(--danger);font-weight:600;white-space:normal;line-height:1.35}
 .dev-cap{color:#22c55e;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* Self-registered modules. A pending card is the one thing on the strip that wants a click, so it
+   gets the amber ring the rest of the page never uses; blocked is deliberately dull. */
+.dev.pend{border-color:#f59e0b;box-shadow:0 0 0 2px rgba(245,158,11,.28)}
+.dev.pend.on{box-shadow:0 0 0 2px var(--ring),0 0 0 4px rgba(245,158,11,.28)}
+.dev.blk{opacity:.7}
+.dev-badge{flex:none;font-size:10px;font-weight:700;padding:1px 6px;border-radius:5px;white-space:nowrap;line-height:1.5}
+.dev-badge.pend{color:#b45309;background:rgba(245,158,11,.2)}
+.dev-badge.blk{color:var(--muted);background:color-mix(in srgb,var(--muted) 16%,transparent)}
+/* Trust + command buttons live on their own row at the bottom of the card, small enough that a
+   card with three of them is still narrower than a phone screen. */
+.dev-acts{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
+.dev-acts button{font-size:11px;padding:2px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink);cursor:pointer;line-height:1.6;white-space:nowrap}
+.dev-acts button:hover{border-color:var(--muted)}
+.dev-acts button.ok{color:#16a34a;border-color:color-mix(in srgb,#22c55e 45%,transparent);font-weight:600}
+.dev-acts button.bad{color:var(--danger)}
+.dev-acts button:disabled{opacity:.5;cursor:default}
+/* Last command and its outcome — the module's own words (bytes written, why the HMAC failed). */
+.dev-cmd{font-size:11px;color:var(--muted);margin-top:3px;white-space:normal;line-height:1.35;overflow-wrap:anywhere}
+.dev-cmd.fail{color:var(--danger)}
+.dev-cmd .undo{color:var(--accent);cursor:pointer;margin-left:4px;font-weight:600}
 .dev-all{flex:none;display:flex;align-items:center;padding:0 11px;border:1px dashed var(--line);border-radius:9px;font-size:11.5px;color:var(--muted);cursor:pointer;white-space:nowrap}
 .dev-all.on{color:var(--accent);border-style:solid;border-color:var(--accent);font-weight:600;cursor:default}
 .dev-top{display:flex;align-items:center;gap:7px}
@@ -1093,6 +1391,8 @@ const PAGE = `<!doctype html>
   <a class="mitem danger" href="/logout" role="menuitem">退出</a>
 </div>
 <main><div id="beat"></div><div id="kaStatus"></div><div id="outbox"></div><ul id="list"><li class="empty">加载中…</li></ul></main>
+<!-- 更新脚本… on a module card opens this; which module is kept in data-dev while the picker is up. -->
+<input type="file" id="otaFile" accept=".lua,text/x-lua,text/plain" hidden>
 
 <dialog id="keyDlg">
   <h2>解密密钥</h2>
@@ -1516,6 +1816,114 @@ const ago = (ms) => {
   return h < 24 ? h + " 小时" : Math.floor(h / 24) + " 天";
 };
 
+/* --- self-registered modules: trust, commands, script update --- */
+// Last command per module id ({id, ts, payload, status, detail} or null), from /api/cmd/list.
+// Fetched once per module, then only while its last command is still pending (the module acks
+// within one poll of picking it up) or right after the web queued a new one — not every 10s for
+// every device forever.
+const CMDS = new Map();
+const CMD_DIRTY = new Set();
+const CMD_LABEL = { reboot: "重启", ota: "更新脚本", bases: "改域名" };
+const CMD_STATE = { pending: "待执行", done: "已完成", failed: "失败" };
+
+async function refreshCmd(dev){
+  const cur = CMDS.get(dev);
+  if (CMDS.has(dev) && !CMD_DIRTY.has(dev) && !(cur && cur.status === "pending")) return;
+  try {
+    const r = await fetch("/api/cmd/list?dev=" + encodeURIComponent(dev), { cache: "no-store" });
+    if (!r.ok) return;
+    const rows = await r.json();
+    CMDS.set(dev, rows[0] || null);
+    CMD_DIRTY.delete(dev);
+  } catch {}
+}
+
+// One line for the card: "更新脚本 gw · 已完成 · 18234" / "重启 · 失败 · …". The payload is the
+// server's plain JSON, so this needs no key.
+function cmdSummary(c){
+  if (!c) return "";
+  let p = {}; try { p = JSON.parse(c.payload); } catch {}
+  const what = (CMD_LABEL[p.type] || p.type || "命令") + (p.name ? " " + p.name : "");
+  return [what, CMD_STATE[c.status] || c.status, c.detail || ""].filter(Boolean).join(" · ");
+}
+
+async function setTrust(id, status){
+  const r = await fetch("/api/device/trust", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, status }),
+  });
+  if (r.status === 401) { location.href = "/login"; return; }
+  if (!r.ok) { alert("操作失败：" + r.status); return; }
+  lastBeatSig = null;
+  renderBeat();
+}
+
+// Queue a command; the module runs it on its next poll. 409 means one is still waiting — the
+// server allows one at a time, because most of them end in a reboot.
+async function postCmd(dev, body){
+  const r = await fetch("/api/cmd", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(Object.assign({ dev }, body)),
+  });
+  if (r.status === 401) { location.href = "/login"; return false; }
+  if (r.status === 409) { alert("这台设备还有一条命令没执行完，等它完成或先撤销。"); return false; }
+  if (!r.ok) { alert("命令下发失败：" + r.status + " " + (await r.text().catch(() => ""))); return false; }
+  CMD_DIRTY.add(dev);
+  lastBeatSig = null;
+  renderBeat();
+  return true;
+}
+
+async function undoCmd(dev, id){
+  const r = await fetch("/api/cmd/" + id, { method: "DELETE" });
+  if (r.status === 401) { location.href = "/login"; return; }
+  CMD_DIRTY.add(dev);
+  lastBeatSig = null;
+  renderBeat();
+}
+
+// The command signature. HMAC-SHA256 over name + a newline + the exact bytes under SMS_KEY —
+// the same key that encrypts messages, and the one thing the server never has. (Written out in
+// prose because this comment is inside the page template literal: a backslash-n here would be
+// served as a real line break and split the comment in two.) The name is bound
+// into the signature, so a file signed for gw can never be installed as gcm and an "ota"
+// signature can never pass as a "bases" one. Used by 更新脚本 (name "gw"/"gcm", bytes = the
+// file) and by 改域名 (name "bases", bytes = the normalised address list). The module
+// recomputes it over what it received and refuses anything that doesn't match, so neither a
+// Worker compromise nor an on-path attacker can push code or move the module elsewhere.
+async function hmacHex(name, bytes){
+  const hex = (localStorage.getItem("sms_key") || "").toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(hex)) throw new Error("未设置密钥");
+  const k = await crypto.subtle.importKey("raw", hexToBytes(hex), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const prefix = new TextEncoder().encode(name + "\\n");
+  const data = new Uint8Array(prefix.length + bytes.byteLength);
+  data.set(prefix, 0); data.set(new Uint8Array(bytes), prefix.length);
+  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", k, data));
+  return [...sig].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+const otaFile = document.getElementById("otaFile");
+otaFile.onchange = async () => {
+  const dev = otaFile.dataset.dev, f = otaFile.files[0];
+  otaFile.value = "";
+  if (!dev || !f) return;
+  // Which slot the file goes to comes from its name: the module keeps exactly gw.lua and gcm.lua.
+  const m = /^(gw|gcm)\\.lua$/i.exec(f.name);
+  if (!m) { alert("文件名必须是 gw.lua 或 gcm.lua（决定替换模组上的哪个脚本）。"); return; }
+  const name = m[1].toLowerCase();
+  if (!confirm("把 " + f.name + "（" + f.size + " 字节）推送到「" + (DEVS.get(dev)?.name || dev) + "」？模组校验签名后写入并重启。")) return;
+  try {
+    const bytes = await f.arrayBuffer();
+    const hmac = await hmacHex(name, bytes);
+    const r = await fetch("/api/ota/put?name=" + name, { method: "POST", body: bytes });
+    if (r.status === 401) { location.href = "/login"; return; }
+    if (!r.ok) { alert("上传失败：" + r.status + " " + (await r.text().catch(() => ""))); return; }
+    await postCmd(dev, { type: "ota", name, hmac });
+  } catch (e) {
+    alert("更新脚本失败：" + (e && e.message ? e.message : e));
+  }
+};
+
 async function renderBeat(){
   let data;
   try { data = await (await fetch("/api/status", { cache: "no-store" })).json(); } catch { return; }
@@ -1528,11 +1936,17 @@ async function renderBeat(){
     if (d.info && cryptoKey) { try { info = await openSend(d.info); } catch {} }
     next.set(d.id, {
       id: d.id, ts: d.ts, name: info?.n || ("设备 " + d.id.slice(0, 4)),
-      sims: info?.s || [], caps: info?.c || null, gaps: info?.g || null, ver: info?.v || null, tr: info?.t || null, os: info?.os || null, ls: info?.ls || null,
+      sims: Array.isArray(info?.s) ? info.s : [], caps: info?.c || null, gaps: info?.g || null, ver: info?.v || null, tr: info?.t || null, os: info?.os || null, ls: info?.ls || null,
       cap: info?.cap || null, pp: info?.pp || null, ln: info?.ln || null,
+      // Module registry: status is server-side (the web sets it); the rest is the module's own
+      // self-description, so the card can say which physical device this is.
+      status: d.status || "trusted", module: !!d.module,
+      imei: info?.imei || null, iccid: info?.iccid || null, fw: info?.fw || null, sver: info?.ver || null,
+      ota: info?.ota || null, boot: info?.boot ?? null,
     });
   }
   DEVS = next;
+  for (const d of next.values()) if (d.module && d.status === "trusted") await refreshCmd(d.id);
 
   // Skip the rebuild when nothing shown has changed. Polling every 10s was clearing and recreating
   // every card each time — that full repaint is the flicker. The signature covers only what is
@@ -1544,7 +1958,8 @@ async function renderBeat(){
     empty: devs.length ? 0 : (data.beat || 0),
     devs: [...next.values()].map((d) => {
       const on = nowB - d.ts < ONLINE_MS;
-      return [d.id, on, d.name, d.caps, d.gaps, d.sims, d.ver, d.tr, d.os, d.ls, on ? 0 : ago(nowB - d.ts)];
+      return [d.id, on, d.name, d.caps, d.gaps, d.sims, d.ver, d.tr, d.os, d.ls, on ? 0 : ago(nowB - d.ts),
+        d.status, d.module, d.imei, d.iccid, d.fw, d.sver, d.ota, d.boot, cmdSummary(CMDS.get(d.id))];
     }),
   });
   if (sig === lastBeatSig) return;
@@ -1589,13 +2004,24 @@ async function renderBeat(){
     // the single-row version wrapped in the middle of a word.
     const box = document.createElement("div");
     box.className = ACTIVE_DEV === d.id ? "dev on" : "dev";
+    // A module that isn't trusted yet is the card you came to click, so it stands out; a blocked
+    // one fades but stays listed — it is still registering, and 忘记 is how it really goes away.
+    if (d.module && d.status === "pending") box.classList.add("pend");
+    if (d.module && d.status === "blocked") box.classList.add("blk");
     box.title = ACTIVE_DEV === d.id ? "再点一次显示全部设备" : "只看这台设备";
-    box.onclick = (e) => { if (!e.target.closest(".del")) setActiveDev(d.id); };
+    box.onclick = (e) => { if (!e.target.closest(".del,.dev-acts,.dev-cmd")) setActiveDev(d.id); };
     const top = document.createElement("div"); top.className = "dev-top";
     const dot = document.createElement("span");
     dot.textContent = "●"; dot.style.color = on ? "#22c55e" : "var(--danger)";
     const name = document.createElement("span"); name.className = "dev-name";
     name.textContent = d.name;
+    // Trusted needs no badge — that is the state every phone has always been in.
+    if (d.module && d.status !== "trusted") {
+      const badge = document.createElement("span");
+      badge.className = "dev-badge " + (d.status === "pending" ? "pend" : "blk");
+      badge.textContent = d.status === "pending" ? "待信任" : "已拉黑";
+      top.append(badge);
+    }
     const state = document.createElement("span"); state.className = "dev-state";
     // Offline text goes calm (not red) when the phone can still forward — the red dot already
     // carries the liveness signal, and a red "离线" beside a working phone is the false alarm this
@@ -1751,6 +2177,84 @@ async function renderBeat(){
       sub.append(line);
     }
     box.append(top, sub);
+    if (d.module) {
+      // Which physical module is this? Last 6 of IMEI/ICCID is enough to match the sticker on the
+      // board or the SIM, and short enough to fit; the carrier already shows on the SIM line above.
+      // Firmware / script / active OTA slot / boot-fail counter are what you look at before
+      // deciding whether to push an update or just reboot.
+      const idl = [d.imei ? "IMEI …" + String(d.imei).slice(-6) : "", d.iccid ? "ICCID …" + String(d.iccid).slice(-6) : ""].filter(Boolean);
+      if (idl.length) {
+        const l = document.createElement("div"); l.className = "dev-sims";
+        l.textContent = idl.join(" · "); l.title = l.textContent;
+        sub.append(l);
+      }
+      const swl = [d.fw ? "固件 " + d.fw : "", d.sver ? "脚本 " + d.sver : "", d.ota ? "ota " + d.ota : "",
+        d.boot != null && d.boot !== "" ? "重启计数 " + d.boot : ""].filter(Boolean);
+      if (swl.length) {
+        const l = document.createElement("div"); l.className = "dev-sims";
+        l.textContent = swl.join(" · "); l.title = l.textContent;
+        sub.append(l);
+      }
+      const acts = document.createElement("div"); acts.className = "dev-acts";
+      const mk = (label, cls, fn) => {
+        const b = document.createElement("button"); b.type = "button"; b.textContent = label;
+        if (cls) b.className = cls;
+        b.onclick = async (e) => { e.stopPropagation(); b.disabled = true; try { await fn(); } finally { b.disabled = false; } };
+        acts.append(b);
+      };
+      const block = async () => {
+        if (confirm("拉黑「" + d.name + "」？它将不能上报、也收不到发送任务，随时可再信任。")) await setTrust(d.id, "blocked");
+      };
+      if (d.status !== "trusted") mk("信任", "ok", () => setTrust(d.id, "trusted"));
+      // A stranger's card offers 拉黑 as well: 忘记 only deletes the row, and the module is back as
+      // 待信任 on its next attempt. Blocked rows also stop counting toward the pending cap.
+      if (d.status === "pending") mk("拉黑", "bad", block);
+      if (d.status === "trusted") {
+        mk("重启", "", async () => { if (confirm("重启「" + d.name + "」？")) await postCmd(d.id, { type: "reboot" }); });
+        mk("改域名…", "", async () => {
+          // Signed with SMS_KEY like 更新脚本 is, and for a bigger reason: this is the one command
+          // that can move the module to someone else's server for good. Without the key we cannot
+          // sign, and the module would refuse it — so say so before asking for anything.
+          if (!cryptoKey) { alert("请先点「密钥」填入 SMS_KEY —— 脚本要用它签名，模组才会接受。"); return; }
+          const v = prompt("新的服务器地址，多个用逗号分隔（必须 https://）。模组保存后会重启：", location.origin);
+          if (v == null) return;
+          // Same rule as the server's okUrl: https, host[:port][/path], nothing the module's
+          // "/api/…" join could trip over (no ?, #, quotes, escapes), trailing "/" dropped.
+          const list = v.split(",").map((s) => s.trim().replace(/\\/+$/, "")).filter(Boolean);
+          const okUrl = (s) => s.length <= 120 && /^https:\\/\\/[A-Za-z0-9.-]+(:[0-9]+)?(\\/[A-Za-z0-9._~\\/-]*)?$/.test(s);
+          if (!list.length || list.length > 5 || !list.every(okUrl)) {
+            alert("每个地址都要以 https:// 开头，只能是域名[:端口][/路径]（不能带 ?、# 或引号），最多 5 个，每个不超过 120 字符。"); return;
+          }
+          // Sign the normalised list — exactly the bytes the server stores and the module verifies.
+          const value = list.join(",");
+          try {
+            const hmac = await hmacHex("bases", new TextEncoder().encode(value));
+            await postCmd(d.id, { type: "bases", value, hmac });
+          } catch (e) {
+            alert("改域名失败：" + (e && e.message ? e.message : e));
+          }
+        });
+        mk("更新脚本…", "", async () => {
+          if (!cryptoKey) { alert("请先点「密钥」填入 SMS_KEY —— 脚本要用它签名，模组才会接受。"); return; }
+          otaFile.dataset.dev = d.id;
+          otaFile.click();
+        });
+        mk("拉黑", "bad", block);
+      }
+      box.append(acts);
+      const c = CMDS.get(d.id);
+      if (d.status === "trusted" && c) {
+        const l = document.createElement("div"); l.className = "dev-cmd" + (c.status === "failed" ? " fail" : "");
+        l.textContent = cmdSummary(c);
+        if (c.status === "pending") {
+          const u = document.createElement("span"); u.className = "undo"; u.textContent = "撤销";
+          u.title = "模组还没取走这条命令，可以撤回";
+          u.onclick = (e) => { e.stopPropagation(); undoCmd(d.id, c.id); };
+          l.append(u);
+        }
+        box.append(l);
+      }
+    }
     beatEl.append(box);
   }
   applyDevFilter();
@@ -1910,6 +2414,8 @@ async function fillSim(sel){
   sel.append(new Option(DEVS.size > 1 ? "默认（任意手机的默认卡）" : "默认卡", ""));
   for (const d of DEVS.values()) {
     if (ACTIVE_DEV && d.id !== ACTIVE_DEV) continue;   // page is filtered to one phone
+    // A pending/blocked module can't claim a send; offering its SIM would just park the row.
+    if (d.status && d.status !== "trusted") continue;
     if (d.sims.length) {
       for (const c of d.sims) {
         // Always name the phone, even with only one paired: the whole reason device ids exist is
