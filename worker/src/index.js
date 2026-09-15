@@ -688,6 +688,14 @@ export default {
       }
       const name = url.searchParams.get("name") || "";
       if (!OTA_NAMES.has(name)) return new Response('{"error":"bad"}', { status: 400 });
+      // The file's own HMAC, computed in the browser under SMS_KEY — the same value the "ota"
+      // command carries. Optional, and never trusted here (the server has no key to check it
+      // with): it is kept beside the file only so the 短信指令 composer can offer "用上次上传的"
+      // without the file in hand, because an SMS "#ota gw <hmac>" is nothing but that hmac. A
+      // malformed one is refused rather than stored — a stored lie would be copied straight into
+      // a command the module then rejects, with nothing on screen to say why.
+      const hmacQ = url.searchParams.get("hmac");
+      if (hmacQ !== null && !/^[0-9a-f]{64}$/i.test(hmacQ)) return new Response('{"error":"bad hmac"}', { status: 400 });
       if (Number(request.headers.get("Content-Length") || 0) > 200_000) return new Response('{"error":"too large"}', { status: 413 });
       const bytes = await request.arrayBuffer();
       if (bytes.byteLength > 200_000) return new Response('{"error":"too large"}', { status: 413 });
@@ -697,6 +705,7 @@ export default {
       const sha256 = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))]
         .map((b) => b.toString(16).padStart(2, "0")).join("");
       const meta = { size: bytes.byteLength, ts: Date.now(), sha256 };
+      if (hmacQ) meta.hmac = hmacQ.toLowerCase();
       await env.APK.put("ota:" + name, bytes);
       await env.APK.put("ota:" + name + ":meta", JSON.stringify(meta));
       return Response.json({ ok: true, size: meta.size, sha256 });
@@ -705,6 +714,9 @@ export default {
       if (!(await sessionValid(request, env))) {
         return new Response('{"error":"unauthorized"}', { status: 401, headers: { "Content-Type": "application/json" } });
       }
+      // The stored meta verbatim — size/ts/sha256, plus `hmac` when the upload carried one.
+      // An entry written before that param existed simply has no `hmac`, and the page's
+      // 「用上次上传的」shortcut stays hidden for it.
       const out = {};
       for (const n of OTA_NAMES) {
         const m = await env.APK?.get("ota:" + n + ":meta");
@@ -1370,6 +1382,22 @@ dialog input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px 
 .row{display:flex;gap:8px;justify-content:flex-end}
 .row button{padding:9px 16px;border-radius:9px;border:1px solid var(--line);background:var(--card);color:var(--ink);cursor:pointer;font-size:14px}
 .row button.primary{background:var(--accent);color:var(--accent-ink);border-color:transparent;font-weight:600}
+/* 短信指令 composer. The field vocabulary is the one the 发短信/定时保号 dialogs already use,
+   lifted out of their inline styles because this dialog has six of them. */
+.fl{display:block;font-size:13px;color:var(--muted);margin:-4px 0 6px}
+.fs{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid var(--line);border-radius:9px;background:var(--bg);color:var(--ink);font-size:16px;margin-bottom:14px}
+.fh{color:var(--muted);font-size:12.5px;line-height:1.55;margin:10px 0 0}
+/* The line to send: selectable and wrapping, because the fallback when the QR won't scan is
+   reading or copying it by hand. */
+.smsline{
+  font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--bg);
+  border:1px solid var(--line);border-radius:9px;padding:10px 12px;overflow-wrap:anywhere;
+  user-select:all;-webkit-user-select:all;
+}
+/* White ground regardless of the page theme: a scanner reading a dark-on-dark QR sees nothing,
+   and the quiet zone is part of the SVG so no padding may eat into it. */
+.qrbox{display:flex;justify-content:center;margin-top:14px}
+.qrbox svg{width:240px;height:240px;max-width:100%;background:#fff;border-radius:10px;display:block}
 `;
 
 const PAGE = `<!doctype html>
@@ -1397,6 +1425,9 @@ const PAGE = `<!doctype html>
   <button class="mitem" id="testPushBtn" type="button" role="menuitem"><span>测试推送</span></button>
   <button class="mitem" id="keyBtn" type="button" role="menuitem">密钥</button>
   <button class="mitem" id="kaBtn" type="button" role="menuitem">定时保号</button>
+  <!-- Deliberately here and not only on a module card: this is the path for when there IS no
+       card — the module is offline, blocked, or was forgotten, or the page never saw it. -->
+  <button class="mitem" id="smsCmdBtn" type="button" role="menuitem">短信指令</button>
   <a class="mitem danger" href="/logout" role="menuitem">退出</a>
 </div>
 <main><div id="beat"></div><div id="kaStatus"></div><div id="outbox"></div><ul id="list"><li class="empty">加载中…</li></ul></main>
@@ -1461,6 +1492,45 @@ const PAGE = `<!doctype html>
   <div class="row">
     <button type="button" id="kaCancel">取消</button>
     <button type="button" class="primary" id="kaSave">保存</button>
+  </div>
+</dialog>
+
+<dialog id="smsDlg">
+  <h2>短信指令</h2>
+  <p>网页或域名都够不着模组时用这条：把下面生成的那一行发给模组的 SIM 卡号，模组验签后执行。
+     整行在这台设备上生成并签名，号码只用来做二维码，不上传。</p>
+  <label class="fl" for="smsTo">目标号码（模组那张 SIM）</label>
+  <input id="smsTo" class="fs" placeholder="模组的手机号" inputmode="tel" autocomplete="off">
+  <label class="fl" for="smsCmdSel">指令</label>
+  <select id="smsCmdSel" class="fs">
+    <option value="status">状态</option>
+    <option value="reboot">重启</option>
+    <option value="bases">改域名</option>
+    <option value="reset">恢复默认域名</option>
+    <option value="ota">更新脚本</option>
+    <option value="otaclear">清除更新</option>
+  </select>
+  <div id="smsUrlWrap" hidden>
+    <label class="fl" for="smsUrl">新的服务器地址，多个用逗号分隔（必须 https://）</label>
+    <input id="smsUrl" class="fs" placeholder="https://a.example,https://b.example" spellcheck="false" autocomplete="off">
+  </div>
+  <div id="smsOtaWrap" hidden>
+    <label class="fl" for="smsOtaFile">脚本文件（文件名决定替换哪个：gw.lua / gcm.lua）</label>
+    <input type="file" id="smsOtaFile" class="fs" accept=".lua,text/x-lua,text/plain">
+    <div id="smsOtaLast"></div>
+    <p id="smsOtaNote" class="fh"></p>
+  </div>
+  <div class="row">
+    <button type="button" id="smsClose">关闭</button>
+    <button type="button" class="primary" id="smsGo">生成</button>
+  </div>
+  <div id="smsOut" hidden>
+    <div id="smsLine" class="smsline"></div>
+    <div class="row" style="justify-content:flex-start;margin-top:10px">
+      <button type="button" id="smsCopy">复制</button>
+    </div>
+    <div id="smsQr" class="qrbox"></div>
+    <p id="smsHint" class="fh"></p>
   </div>
 </dialog>
 
@@ -1936,7 +2006,9 @@ otaFile.onchange = async () => {
   try {
     const bytes = await f.arrayBuffer();
     const hmac = await hmacHex(name, bytes);
-    const r = await fetch("/api/ota/put?name=" + name, { method: "POST", body: bytes });
+    // The hmac rides along so it is stored beside the file: an SMS "#ota <slot> <hmac>" is
+    // nothing but that value, and 短信指令 can then offer this upload without the file again.
+    const r = await fetch("/api/ota/put?name=" + name + "&hmac=" + hmac, { method: "POST", body: bytes });
     if (r.status === 401) { location.href = "/login"; return; }
     if (!r.ok) { alert("上传失败：" + r.status + " " + (await r.text().catch(() => ""))); return; }
     await postCmd(dev, { type: "ota", name, hmac });
@@ -1963,6 +2035,9 @@ async function renderBeat(){
       // self-description, so the card can say which physical device this is.
       status: d.status || "trusted", module: !!d.module,
       imei: info?.imei || null, iccid: info?.iccid || null, fw: info?.fw || null, sver: info?.ver || null,
+      // The module's own SIM number, when the firmware could read it off the card. Never shown
+      // on the card — it is only the initial value the 短信指令 composer offers for 目标号码.
+      num: info?.num || null,
       ota: info?.ota || null, boot: info?.boot ?? null,
     });
   }
@@ -2265,6 +2340,9 @@ async function renderBeat(){
         });
         mk("拉黑", "bad", block);
       }
+      // Always offered, whatever the trust state: a blocked, never-trusted or long-offline
+      // module is exactly the one the web can no longer reach, and SMS is the way back in.
+      mk("短信…", "", () => openSmsDlg(d.id));
       box.append(acts);
       const c = CMDS.get(d.id);
       if (d.status === "trusted" && c) {
@@ -2855,6 +2933,423 @@ if ("serviceWorker" in navigator) {
     if (e.data && e.data.type === "sms") poll();
   });
 }
+
+/* ============================================================== QR encoder ==
+   Inlined, and this is the one place on the page where that is load-bearing: the 短信指令
+   composer below exists for the moment the Worker or the domain cannot be reached, so a CDN
+   would be exactly as unreachable as everything else it is meant to rescue. Byte mode, ECC
+   level M, versions 1-10 — enough for every command this dialog can build (213 bytes at the
+   top end) and small enough to read in one sitting.
+
+   Everything the spec says about whether a phone can actually read the result is here:
+   mode+length header, terminator and EC/11 padding, Reed-Solomon per block with the real
+   block layout, interleaving, function patterns, BCH-protected format and (v7+) version
+   info, and all eight data masks scored by the four penalty rules — the mask is chosen, not
+   hardcoded, because a bad one on a given payload is a QR that will not scan.            */
+
+// [data codewords, EC codewords per block, group-1 blocks, group-2 blocks] per version, ECC M.
+// A group-2 block holds exactly one data codeword more than a group-1 one.
+const QR_ECC = [
+  [16, 10, 1, 0], [28, 16, 1, 0], [44, 26, 1, 0], [64, 18, 2, 0], [86, 24, 2, 0],
+  [108, 16, 4, 0], [124, 18, 4, 0], [154, 22, 2, 2], [182, 22, 3, 2], [216, 26, 4, 1],
+];
+// Alignment-pattern centre coordinates per version; every pair of them carries a pattern
+// except the three that would sit on a finder.
+const QR_ALIGN = [[], [6,18], [6,22], [6,26], [6,30], [6,34], [6,22,38], [6,24,42], [6,26,46], [6,28,50]];
+
+// GF(256) with the QR primitive polynomial 0x11d, as log/antilog tables — the doubled exp
+// table lets a product skip the modulo on the exponent.
+const GF_EXP = new Uint8Array(512), GF_LOG = new Uint8Array(256);
+(() => {
+  let x = 1;
+  for (let i = 0; i < 255; i++) { GF_EXP[i] = x; GF_LOG[x] = i; x <<= 1; if (x & 0x100) x ^= 0x11d; }
+  for (let i = 255; i < 512; i++) GF_EXP[i] = GF_EXP[i - 255];
+})();
+const gfMul = (a, b) => (a && b) ? GF_EXP[GF_LOG[a] + GF_LOG[b]] : 0;
+
+// The RS generator polynomial of degree n, highest coefficient first.
+function qrRsGen(n){
+  let g = [1];
+  for (let i = 0; i < n; i++){
+    const next = new Array(g.length + 1).fill(0);
+    for (let j = 0; j < g.length; j++){ next[j] ^= g[j]; next[j + 1] ^= gfMul(g[j], GF_EXP[i]); }
+    g = next;
+  }
+  return g;
+}
+// The remainder of data(x)*x^ecLen over the generator: the block's EC codewords.
+function qrRs(data, ecLen){
+  const g = qrRsGen(ecLen), res = new Uint8Array(data.length + ecLen);
+  res.set(data);
+  for (let i = 0; i < data.length; i++){
+    const f = res[i];
+    if (!f) continue;
+    for (let j = 0; j < g.length; j++) res[i + j] ^= gfMul(g[j], f);
+  }
+  return res.slice(data.length);
+}
+
+// The eight data masks, by their spec condition (x = column, y = row).
+const QR_MASK = [
+  (x, y) => (x + y) % 2 === 0,
+  (x, y) => y % 2 === 0,
+  (x, y) => x % 3 === 0,
+  (x, y) => (x + y) % 3 === 0,
+  (x, y) => (Math.floor(y / 2) + Math.floor(x / 3)) % 2 === 0,
+  (x, y) => (x * y) % 2 + (x * y) % 3 === 0,
+  (x, y) => ((x * y) % 2 + (x * y) % 3) % 2 === 0,
+  (x, y) => ((x + y) % 2 + (x * y) % 3) % 2 === 0,
+];
+
+// The four penalty rules, lower is better: long same-colour runs, 2x2 blocks, anything that
+// looks like a finder, and an unbalanced dark/light ratio.
+function qrPenalty(mod, size){
+  let p = 0;
+  for (let t = 0; t < 2; t++){
+    for (let i = 0; i < size; i++){
+      let line = "";
+      for (let j = 0; j < size; j++) line += (t === 0 ? mod[i][j] : mod[j][i]) ? "1" : "0";
+      let run = 1;
+      for (let j = 1; j < size; j++){
+        if (line[j] === line[j - 1]) run++;
+        else { if (run >= 5) p += 3 + run - 5; run = 1; }
+      }
+      if (run >= 5) p += 3 + run - 5;
+      // 1:1:3:1:1 with four light modules on one side — the finder's own signature, which is
+      // why a scanner mistakes it for one.
+      for (let j = 0; j + 11 <= size; j++){
+        const s = line.slice(j, j + 11);
+        if (s === "10111010000" || s === "00001011101") p += 40;
+      }
+    }
+  }
+  for (let y = 0; y + 1 < size; y++) for (let x = 0; x + 1 < size; x++){
+    const v = mod[y][x];
+    if (v === mod[y][x + 1] && v === mod[y + 1][x] && v === mod[y + 1][x + 1]) p += 3;
+  }
+  let dark = 0;
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) dark += mod[y][x];
+  p += Math.floor(Math.abs(dark * 100 / (size * size) - 50) / 5) * 10;
+  return p;
+}
+
+// → {size, mod} (mod[y][x] = 0|1), or null when the payload does not fit version 10.
+function qrEncode(str){
+  const bytes = new TextEncoder().encode(str);
+  let ver = 0;
+  for (let v = 1; v <= 10; v++){
+    if (bytes.length * 8 + 4 + (v < 10 ? 8 : 16) <= QR_ECC[v - 1][0] * 8) { ver = v; break; }
+  }
+  if (!ver) return null;
+  const dcw = QR_ECC[ver - 1][0], ecLen = QR_ECC[ver - 1][1];
+  const g1 = QR_ECC[ver - 1][2], g2 = QR_ECC[ver - 1][3], nb = g1 + g2;
+
+  // --- bit stream: mode 0100, the length, the bytes, a 4-bit terminator, then EC/11 padding
+  const bits = [];
+  const put = (val, len) => { for (let i = len - 1; i >= 0; i--) bits.push((val >> i) & 1); };
+  put(4, 4);
+  put(bytes.length, ver < 10 ? 8 : 16);
+  for (const b of bytes) put(b, 8);
+  for (let i = 0; i < 4 && bits.length < dcw * 8; i++) bits.push(0);
+  while (bits.length % 8) bits.push(0);
+  const data = new Uint8Array(dcw);
+  for (let i = 0; i < bits.length; i += 8){
+    let b = 0;
+    for (let j = 0; j < 8; j++) b = (b << 1) | bits[i + j];
+    data[i / 8] = b;
+  }
+  for (let i = bits.length / 8, pad = 0; i < dcw; i++, pad++) data[i] = pad % 2 ? 0x11 : 0xec;
+
+  // --- split into blocks, add EC to each, interleave (data first, then EC)
+  const perBlk = Math.floor(dcw / nb);
+  const blocks = [], ecs = [];
+  for (let i = 0, off = 0; i < nb; i++){
+    const len = perBlk + (i >= g1 ? 1 : 0);
+    const blk = data.slice(off, off + len); off += len;
+    blocks.push(blk); ecs.push(qrRs(blk, ecLen));
+  }
+  const out = [];
+  for (let i = 0; i <= perBlk; i++) for (const b of blocks) if (i < b.length) out.push(b[i]);
+  for (let i = 0; i < ecLen; i++) for (const e of ecs) out.push(e[i]);
+
+  // --- the matrix: function patterns first, so data placement knows what to skip
+  const size = ver * 4 + 17;
+  const mod = [], fun = [];
+  for (let i = 0; i < size; i++){ mod.push(new Array(size).fill(0)); fun.push(new Array(size).fill(0)); }
+  const setF = (x, y, v) => { if (x >= 0 && y >= 0 && x < size && y < size){ mod[y][x] = v ? 1 : 0; fun[y][x] = 1; } };
+  // Finder + its separator in one pass: ring distance 0-1 and 3 are dark, 2 is the light ring,
+  // 4 is the separator.
+  const finder = (ox, oy) => {
+    for (let dy = -1; dy <= 7; dy++) for (let dx = -1; dx <= 7; dx++){
+      const d = Math.max(Math.abs(dx - 3), Math.abs(dy - 3));
+      setF(ox + dx, oy + dy, d !== 2 && d <= 3);
+    }
+  };
+  finder(0, 0); finder(size - 7, 0); finder(0, size - 7);
+  for (let i = 8; i < size - 8; i++){ setF(i, 6, i % 2 === 0); setF(6, i, i % 2 === 0); }
+  const al = QR_ALIGN[ver - 1];
+  for (const cy of al) for (const cx of al){
+    if ((cx === 6 && cy === 6) || (cx === 6 && cy === size - 7) || (cx === size - 7 && cy === 6)) continue;
+    for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++)
+      setF(cx + dx, cy + dy, Math.max(Math.abs(dx), Math.abs(dy)) !== 1);
+  }
+  // Format info: 5 data bits (ECC M = 00, then the mask) protected by BCH(15,5) over 0x537 and
+  // XORed with 0x5412 so an all-zero format can never look valid. Drawn twice.
+  const drawFormat = (mask) => {
+    const d5 = mask;                       // ECC M contributes 0 to the high two bits
+    let rem = d5;
+    for (let i = 0; i < 10; i++) rem = (rem << 1) ^ ((rem >>> 9) * 0x537);
+    const f = ((d5 << 10) | rem) ^ 0x5412;
+    const bit = (i) => (f >>> i) & 1;
+    for (let i = 0; i <= 5; i++) setF(8, i, bit(i));
+    setF(8, 7, bit(6)); setF(8, 8, bit(7)); setF(7, 8, bit(8));
+    for (let i = 9; i < 15; i++) setF(14 - i, 8, bit(i));
+    for (let i = 0; i < 8; i++) setF(size - 1 - i, 8, bit(i));
+    for (let i = 8; i < 15; i++) setF(8, size - 15 + i, bit(i));
+    setF(8, size - 8, 1);                  // the dark module, always
+  };
+  drawFormat(0);                           // reserve the cells; the real bits go in below
+  if (ver >= 7){
+    // Version info: 6 bits + BCH(18,6) over 0x1f25, in two 3x6 blocks by the finders.
+    let rem = ver;
+    for (let i = 0; i < 12; i++) rem = (rem << 1) ^ ((rem >>> 11) * 0x1f25);
+    const vbits = (ver << 12) | rem;
+    for (let i = 0; i < 18; i++){
+      const b = (vbits >>> i) & 1, a = size - 11 + i % 3, c = Math.floor(i / 3);
+      setF(a, c, b); setF(c, a, b);
+    }
+  }
+  // --- data: two columns at a time, bottom-right upward, zigzagging, skipping column 6
+  let bi = 0;
+  for (let right = size - 1; right >= 1; right -= 2){
+    if (right === 6) right = 5;
+    for (let vert = 0; vert < size; vert++){
+      for (let j = 0; j < 2; j++){
+        const x = right - j;
+        const y = (((right + 1) & 2) === 0) ? size - 1 - vert : vert;
+        if (!fun[y][x] && bi < out.length * 8){
+          mod[y][x] = (out[bi >>> 3] >>> (7 - (bi & 7))) & 1;
+          bi++;
+        }
+      }
+    }
+  }
+  // --- all eight masks, scored; keep the best. XOR is its own inverse, so each trial is undone
+  // by re-applying it.
+  let best = -1, bestP = Infinity;
+  for (let m = 0; m < 8; m++){
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) if (!fun[y][x] && QR_MASK[m](x, y)) mod[y][x] ^= 1;
+    drawFormat(m);
+    const p = qrPenalty(mod, size);
+    if (p < bestP) { bestP = p; best = m; }
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) if (!fun[y][x] && QR_MASK[m](x, y)) mod[y][x] ^= 1;
+  }
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) if (!fun[y][x] && QR_MASK[best](x, y)) mod[y][x] ^= 1;
+  drawFormat(best);
+  return { size, mod, ver, mask: best };
+}
+
+// One SVG path of horizontal runs, on a white rect that includes the 4-module quiet zone —
+// crisp at any size, no canvas, and nothing to load.
+function qrSvg(m){
+  const q = 4, total = m.size + q * 2;
+  let d = "";
+  for (let y = 0; y < m.size; y++){
+    let x = 0;
+    while (x < m.size){
+      if (!m.mod[y][x]) { x++; continue; }
+      let w = 1;
+      while (x + w < m.size && m.mod[y][x + w]) w++;
+      d += "M" + (x + q) + " " + (y + q) + "h" + w + "v1h-" + w + "z";
+      x += w;
+    }
+  }
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", "0 0 " + total + " " + total);
+  svg.setAttribute("shape-rendering", "crispEdges");
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", "短信二维码");
+  const bg = document.createElementNS(NS, "rect");
+  bg.setAttribute("width", String(total)); bg.setAttribute("height", String(total)); bg.setAttribute("fill", "#fff");
+  const path = document.createElementNS(NS, "path");
+  path.setAttribute("d", d); path.setAttribute("fill", "#000");
+  svg.append(bg, path);
+  return svg;
+}
+
+/* --- 短信指令: compose a signed SMS command, and hand the phone a QR of it -----------------
+   The same wire format main.lua verifies (sms_split / sms_signed) and luatos/sms-sign.sh
+   prints: "<body> <mac>", one space, no trailing whitespace, mac = the first 16 hex of
+   HMAC-SHA256 over "sms" + a newline + the body under SMS_KEY. Nothing is sent from here —
+   the point of the channel is that there may be nothing left to send to. */
+const smsDlg = document.getElementById("smsDlg");
+const smsToIn = document.getElementById("smsTo");
+const smsCmdSel = document.getElementById("smsCmdSel");
+const smsUrlIn = document.getElementById("smsUrl");
+const smsOtaFile = document.getElementById("smsOtaFile");
+const smsOtaLast = document.getElementById("smsOtaLast");
+const smsOtaNote = document.getElementById("smsOtaNote");
+const smsOut = document.getElementById("smsOut");
+const smsLine = document.getElementById("smsLine");
+const smsQr = document.getElementById("smsQr");
+const smsHint = document.getElementById("smsHint");
+let SMS_DEV = "";     // the module the dialog was opened for; "" = opened from the ⋯ menu
+let SMS_OTA = null;   // {name, hmac} once a script is staged — uploaded just now, or last time
+
+// Remembered per module: two modules are two SIMs. The bare key is the no-device case, which
+// is also the one that matters most — the card may be gone, that is why you are here.
+const smsToKey = (dev) => "sms_to:" + (dev || "");
+
+function smsCmdChanged(){
+  const k = smsCmdSel.value;
+  document.getElementById("smsUrlWrap").hidden = k !== "bases";
+  document.getElementById("smsOtaWrap").hidden = k !== "ota";
+  smsOut.hidden = true;                 // a stale line under a freshly changed command misleads
+}
+
+// 「用上次上传的」. An SMS "#ota" carries nothing but the file's hmac, so a script already
+// staged on the Worker needs no upload at all — but only if its hmac was stored with it.
+// Anything put there before /api/ota/put learned the param has none, and gets no shortcut.
+async function smsOtaShortcuts(){
+  smsOtaLast.textContent = "";
+  let meta = null;
+  try { const r = await fetch("/api/ota/meta", { cache: "no-store" }); if (r.ok) meta = await r.json(); } catch {}
+  if (!meta) return;
+  for (const name of ["gw", "gcm"]) {
+    const m = meta[name];
+    if (!m || !/^[0-9a-f]{64}$/i.test(String(m.hmac || ""))) continue;
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "out wide";
+    b.textContent = "用上次上传的 " + name + ".lua（" + m.size + " 字节）";
+    b.onclick = () => {
+      SMS_OTA = { name, hmac: String(m.hmac).toLowerCase() };
+      smsOtaNote.textContent = "用服务器上已有的 " + name + ".lua，签名 " + SMS_OTA.hmac.slice(0, 16) + "…";
+    };
+    smsOtaLast.append(b);
+  }
+}
+
+async function openSmsDlg(dev){
+  // The same refusal 更新脚本 gives: with no key nothing can be signed, and the module would
+  // ignore whatever this dialog produced.
+  if (!cryptoKey) { alert("请先点「密钥」填入 SMS_KEY —— 脚本要用它签名，模组才会接受。"); return; }
+  SMS_DEV = dev || "";
+  SMS_OTA = null;
+  let to = "";
+  try { to = localStorage.getItem(smsToKey(SMS_DEV)) || ""; } catch {}
+  // The module reports its own SIM number in the register blob when the firmware can read it
+  // off the card, so the common case is: open, pick, generate.
+  if (!to && SMS_DEV) to = String((DEVS.get(SMS_DEV) || {}).num || "");
+  if (!to) { try { to = localStorage.getItem(smsToKey("")) || ""; } catch {} }
+  smsToIn.value = to;
+  smsUrlIn.value = location.origin;
+  smsOtaFile.value = "";
+  smsOtaNote.textContent = "";
+  smsOtaLast.textContent = "";
+  smsQr.textContent = "";
+  smsCmdChanged();
+  smsDlg.showModal();
+  smsOtaShortcuts();                    // needs the Worker; the rest of the dialog does not
+}
+
+smsCmdSel.onchange = smsCmdChanged;
+document.getElementById("smsCmdBtn").onclick = () => openSmsDlg("");
+document.getElementById("smsClose").onclick = () => smsDlg.close();
+
+smsOtaFile.onchange = async () => {
+  const f = smsOtaFile.files[0];
+  if (!f) return;
+  // Which slot the file goes to comes from its name, exactly like the 更新脚本 flow.
+  const m = /^(gw|gcm)\\.lua$/i.exec(f.name);
+  if (!m) { smsOtaFile.value = ""; alert("文件名必须是 gw.lua 或 gcm.lua（决定替换模组上的哪个脚本）。"); return; }
+  const name = m[1].toLowerCase();
+  smsOtaNote.textContent = "上传中…";
+  try {
+    const bytes = await f.arrayBuffer();
+    const hmac = await hmacHex(name, bytes);
+    // The module still DOWNLOADS the script from the Worker — only the command travels by SMS —
+    // so the file has to be staged first. That is the one part of this flow the Worker is
+    // needed for, which is why 更新脚本 over SMS is for a broken module, not a broken server.
+    const r = await fetch("/api/ota/put?name=" + name + "&hmac=" + hmac, { method: "POST", body: bytes });
+    if (r.status === 401) { location.href = "/login"; return; }
+    if (!r.ok) { smsOtaNote.textContent = "上传失败：" + r.status + " " + (await r.text().catch(() => "")); return; }
+    SMS_OTA = { name, hmac };
+    smsOtaNote.textContent = name + ".lua 已上传（" + f.size + " 字节），模组会从 Worker 下载它。";
+    smsOtaShortcuts();
+  } catch (e) { smsOtaNote.textContent = "上传失败：" + (e && e.message ? e.message : e); }
+};
+
+document.getElementById("smsGo").onclick = async () => {
+  const kind = smsCmdSel.value;
+  let body = "";
+  if (kind === "status") body = "#status";
+  else if (kind === "reboot") body = "#reboot";
+  else if (kind === "reset") body = "#url reset";
+  else if (kind === "otaclear") body = "#ota clear";
+  else if (kind === "bases") {
+    // The rule 改域名 already uses, and the server's okUrl: https, host[:port][/path], nothing
+    // the module's "/api/…" join could trip over, trailing "/" dropped. Sign the NORMALISED
+    // list, because that is the value the module will store and compare against.
+    const list = smsUrlIn.value.split(",").map((s) => s.trim().replace(/\\/+$/, "")).filter(Boolean);
+    const okUrl = (s) => s.length <= 120 && /^https:\\/\\/[A-Za-z0-9.-]+(:[0-9]+)?(\\/[A-Za-z0-9._~\\/-]*)?$/.test(s);
+    if (!list.length || list.length > 5 || !list.every(okUrl)) {
+      alert("每个地址都要以 https:// 开头，只能是域名[:端口][/路径]（不能带 ?、# 或引号），最多 5 个，每个不超过 120 字符。"); return;
+    }
+    body = "#url " + list.join(",");
+  } else if (kind === "ota") {
+    if (!SMS_OTA) { alert("先选一个 gw.lua / gcm.lua 上传，或用上次上传的。"); return; }
+    body = "#ota " + SMS_OTA.name + " " + SMS_OTA.hmac;
+  }
+  let line;
+  try {
+    // hmacHex already signs "<name>" + a newline + the bytes, so the SMS domain tag is just
+    // the name "sms" — and the first 16 hex of it is the mac the device compares.
+    line = body + " " + (await hmacHex("sms", new TextEncoder().encode(body))).slice(0, 16);
+  } catch (e) { alert("签名失败：" + (e && e.message ? e.message : e)); return; }
+  smsLine.textContent = line;
+  try { localStorage.setItem(smsToKey(SMS_DEV), smsToIn.value.trim()); } catch {}
+  smsQr.textContent = "";
+  const to = norm(smsToIn.value);
+  let hint;
+  if (!to) {
+    hint = "没填号码，就只有上面这行 —— 复制它，从任何一部手机发给模组的 SIM 卡号即可。";
+  } else {
+    // SMSTO: is what a phone camera and every scanner app map onto "new message, prefilled".
+    const qr = qrEncode("SMSTO:" + to + ":" + line);
+    if (qr) {
+      smsQr.append(qrSvg(qr));
+      hint = "用手机扫码会打开短信编辑界面，号码和内容已填好，点发送即可；扫不出来就复制上面那行自己发。";
+    } else {
+      // Refused, never truncated: half a command with a good-looking mac is worse than none.
+      hint = "这行太长，二维码装不下（上限 213 字节）—— 复制上面那行自己发。";
+    }
+  }
+  // Same budget warning sms-sign.sh prints on stderr, at the same threshold (body + space + the
+  // 16-char mac, over 160). It still sends, but as a concatenated SMS the module has to reassemble
+  // — and on the break-glass channel a command that silently does nothing is the worst outcome.
+  if (line.length > 160) hint += "（这行 " + line.length + " 字，超过单条短信 160 字的额度：会被拆成多条发出，模组未必拼得回来 —— 能短就短。）";
+  smsHint.textContent = hint;
+  smsOut.hidden = false;
+};
+
+document.getElementById("smsCopy").onclick = async (e) => {
+  const b = e.currentTarget;
+  try {
+    await navigator.clipboard.writeText(smsLine.textContent);
+    b.textContent = "已复制";
+    setTimeout(() => { b.textContent = "复制"; }, 1200);
+  } catch {
+    // Same fallback as the verification-code copy: the clipboard needs a focused document and
+    // a secure context and is refused outright in some browsers. Select the line instead, so
+    // Cmd/Ctrl+C still works rather than leaving the tap looking broken.
+    const r = document.createRange();
+    r.selectNodeContents(smsLine);
+    const sel = getSelection();
+    sel.removeAllRanges();
+    sel.addRange(r);
+  }
+};
 
 // Pull-to-refresh, for the installed PWA where there is no browser chrome to pull on. Touch only,
 // and only when the page is already scrolled to the very top and no dialog is open — drag down past

@@ -255,6 +255,33 @@ expect "6. ota put sha256 matches shasum" "$(jget "$BODY" 'j.sha256')" "$SHA"
 req GET "/api/ota/meta" "${WEB[@]}"
 expect "6. ota meta gw" "$(jget "$BODY" 'j.gw.sha256 + " " + j.gw.size + " " + (j.gw.ts > 0)')" "$SHA $(wc -c < "$TMP/gw.lua" | tr -d ' ') true"
 expect "6. ota meta gcm empty" "$(jget "$BODY" 'j.gcm')" null
+# The `hmac` param: the file's own signature, computed in the browser under SMS_KEY and kept
+# beside the file so the page's 短信指令 composer can offer 「用上次上传的」without the file in
+# hand — an SMS "#ota gw <hmac>" is nothing but that value. The server has no key, so it can
+# only insist on the shape; a malformed one is refused rather than stored, because a stored lie
+# would be copied straight into a command the module then rejects for no visible reason.
+expect "6. ota meta has no hmac when the put carried none" "$(jget "$BODY" 'j.gw.hmac === undefined')" true
+OHMAC=$(printf 'AB%.0s' {1..32})
+OHMAC_LC=$(echo "$OHMAC" | tr 'A-Z' 'a-z')
+req POST "/api/ota/put?name=gw&hmac=$OHMAC" "${WEB[@]}" --data-binary "@$TMP/gw.lua"
+expect "6. ota put with a 64-hex hmac → 200" "$CODE" 200
+req GET "/api/ota/meta" "${WEB[@]}"
+expect "6. ota meta returns the hmac, lowercased" "$(jget "$BODY" 'j.gw.hmac')" "$OHMAC_LC"
+expect "6. …alongside the sha256 it always had" "$(jget "$BODY" 'j.gw.sha256')" "$SHA"
+req POST "/api/ota/put?name=gw&hmac=$(printf 'zz%.0s' {1..32})" "${WEB[@]}" --data-binary "@$TMP/gw.lua"
+expect "6. ota put with a non-hex hmac → 400" "$CODE" 400
+req POST "/api/ota/put?name=gw&hmac=abcd1234" "${WEB[@]}" --data-binary "@$TMP/gw.lua"
+expect "6. ota put with a short hmac → 400" "$CODE" 400
+req POST "/api/ota/put?name=gw&hmac=" "${WEB[@]}" --data-binary "@$TMP/gw.lua"
+expect "6. ota put with an empty hmac → 400" "$CODE" 400
+req GET "/api/ota/meta" "${WEB[@]}"
+expect "6. a refused hmac left the stored meta untouched" "$(jget "$BODY" 'j.gw.hmac')" "$OHMAC_LC"
+# A later put with no param at all drops the shortcut rather than leaving a stale signature
+# beside a different file — that pairing is the one thing this value must never get wrong.
+req POST "/api/ota/put?name=gw" "${WEB[@]}" --data-binary "@$TMP/gw.lua"
+expect "6. ota put without the param → 200" "$CODE" 200
+req GET "/api/ota/meta" "${WEB[@]}"
+expect "6. …and the meta carries no hmac again" "$(jget "$BODY" 'j.gw.hmac === undefined')" true
 GCODE=$(curl -s "$BASE/api/ota/get?dev=$DEV&name=gw" "${AUTH[@]}" -o "$TMP/got.lua" -w '%{http_code}')
 expect "6. ota get → 200" "$GCODE" 200
 cmp -s "$TMP/gw.lua" "$TMP/got.lua" && pass "6. ota get bytes identical" || fail "6. ota get bytes differ"
@@ -342,11 +369,35 @@ expect "9. register again → pending again" "$CODE $BODY" '200 {"status":"pendi
 
 # --- page sanity ---------------------------------------------------------------------------
 PAGE=$(curl -s "$BASE/" "${WEB[@]}")
-for w in "待信任" "更新脚本" "已拉黑" "重启计数" 'id="otaFile"'; do
+# 短信指令 (DESIGN-6): the composer must be reachable from BOTH the ⋯ menu and a module card,
+# it must carry its own QR encoder (no CDN — the whole point is that nothing else is reachable),
+# and it must build an SMSTO: payload.
+# "重启计数" used to be here; the card has rendered the boot-fail counter as "重启 <n>" since it
+# moved onto the 脚本/固件 line, so the grep had been matching nothing. Anchor on the guard that
+# decides whether it is shown at all — "重启" alone appears all over the page.
+for w in "待信任" "更新脚本" "已拉黑" "Number(d.boot) > 0" 'id="otaFile"' \
+         "短信指令" "短信…" 'id="smsDlg"' 'id="smsCmdBtn"' "SMSTO:" "用上次上传的" \
+         "function qrEncode(" "function qrSvg(" "扫不出来就复制上面那行自己发" \
+         "超过单条短信 160 字的额度"; do
     # Here-string, not a pipe: grep -q exits on the first match, and under pipefail the SIGPIPE
     # that gives echo would turn a successful match into a failure.
     grep -q -- "$w" <<<"$PAGE" && pass "page contains $w" || fail "page lacks $w"
 done
+# Budget parity with the shell signer: both warn about the WHOLE line (body + space + 16-char
+# mac) crossing 160 characters. Grepping the number out of each side keeps the two signers from
+# drifting into disagreeing about what fits in a single SMS.
+PAGE_BUDGET=$(grep -o 'line\.length > [0-9]*' <<<"$PAGE" | head -1 | grep -o '[0-9]*')
+SH_BUDGET=$(grep -o '"\$LINE" -le [0-9]*' ../luatos/sms-sign.sh | head -1 | grep -o '[0-9]*')
+expect "page warns over the same single-SMS budget as sms-sign.sh" "$PAGE_BUDGET" "${SH_BUDGET:-none}"
+expect "and that budget is 160" "$PAGE_BUDGET" 160
+
+# The QR encoder is inlined for one reason: the composer exists for the moment nothing else is
+# reachable. A <script src> would quietly reintroduce exactly that dependency.
+if grep -q -- '<script src=' <<<"$PAGE"; then
+    fail "page pulls a script from outside itself — the composer must work with nothing reachable"
+else
+    pass "page loads no external script"
+fi
 
 echo
 echo "all green"
