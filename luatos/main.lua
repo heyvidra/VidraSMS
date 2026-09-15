@@ -58,6 +58,33 @@ kv_set("boot_fail", boot_fail)
 -- in ~9 s, which counts as a failed boot and gets it reverted. gw.lua has none.
 if wdt then pcall(function() wdt.init(9000); sys.timerLoopStart(wdt.feed, 3000); _G.WDT_ARMED = true end) end
 
+-- Commit-confirm for the `bases` override, because this is the one setting that can put the
+-- module somewhere it can never be reached from again: a typo'd or since-dead domain leaves it
+-- talking to nothing, and the web command that would fix it travels over the very link that is
+-- broken. So an override is PROVISIONAL until a poll actually comes back from it; one that never
+-- does is dropped after BASES_TRIES boots and the built-in domains take over. Once confirmed it
+-- is permanent — a later outage on a domain that has worked must never silently roll back.
+local BASES_TRIES = 3
+local rescue_mode = false   -- set in the boot_fail>=3 block below; read by cmd_exec and the health timer
+local ovr = kv_get("bases")
+local ovr_active = type(ovr) == "string" and ovr ~= ""
+local ovr_ok = ovr_active and tostring(kv_get("bases_ok") or "") == "1"
+-- fskv.del is unverified and can silently fail on worn/full flash, exactly the case clear_boot()
+-- is written to survive. For the three keys that decide where the module talks, a failed del would
+-- strand it on a dead override while the log claims it reverted, so verify and, if a key will not
+-- go, tombstone it with "" — merged() and ovr_active both read "" as "no override".
+local function kv_forget(k)
+  pcall(fskv.del, k)
+  if kv_get(k) ~= nil then kv_set(k, "") end
+end
+local function bases_forget()
+  kv_forget("bases"); kv_forget("bases_ok"); kv_forget("bases_try")
+  ovr_active, ovr_ok = false, false
+end
+-- The provisional-override boot counter runs further down, once _G.gw_ota is defined: an override
+-- must not be blamed for an unanswered boot while an unproven OTA copy is the more likely reason
+-- nothing reached the Worker (that copy's own revert is the right remedy).
+
 -- Config = DEFAULTS ← config.lua (REQUIRED: SMS_KEY) ← fskv "bases" (web `bases` command / #url).
 local file_cfg
 do local ok, t = pcall(require, "config"); if ok and type(t) == "table" then file_cfg = t end end
@@ -183,6 +210,35 @@ function _G.gw_ota.clear(reply_to)
   if reply_to then reply(reply_to, "ota cleared rebooting") end
   sys.timerStart(rtos.reboot, 10000)
 end
+
+-- Provisional `bases` override: it is trusted only after a poll comes back from it (gw_alive
+-- below sets bases_ok), so one that never answers is dropped after BASES_TRIES boots and the
+-- built-in domains take over. Placed here, after _G.gw_ota, on purpose: while an unproven OTA
+-- copy is present its own revert is the correct remedy for "nothing reached the Worker", so the
+-- hand-entered domain must not be spent on the OTA copy's failure to poll — count only with no
+-- OTA copy active. bases_try is read defensively: a first unconfirmed boot has no key (→ try 1),
+-- and a present-but-corrupt value (negative / non-integer / out of range on worn flash) drops the
+-- unconfirmed override now rather than looping forever or pinning it — the built-ins are the safe
+-- fallback. A counter that cannot even be written is the same: drop, don't stay un-droppable.
+if ovr_active and not ovr_ok and _G.gw_ota.active() == "-" then
+  local raw = kv_get("bases_try")
+  local tries
+  if raw == nil then
+    tries = 1
+  else
+    local n = math.tointeger(tonumber(raw) or -1)
+    tries = (n and n >= 0 and n < BASES_TRIES) and (n + 1) or BASES_TRIES
+  end
+  if tries >= BASES_TRIES then
+    bases_forget()
+    log.error("main", "bases override unconfirmed after " .. (BASES_TRIES - 1) .. " tries — reverted to the built-in domains")
+  elseif not kv_set("bases_try", tries) then
+    bases_forget()
+    log.error("main", "bases override counter unwritable — reverted to the built-in domains")
+  else
+    log.warn("main", "bases override unconfirmed, boot " .. tries .. "/" .. BASES_TRIES)
+  end
+end
 -- Verify + write. MAC over "<name>\n<bytes>" — the browser (worker page) and test/ota-sign.sh
 -- sign the same input, so a gw.lua signed for gw cannot be installed as gcm.
 local function ota_install(name, body, hmac_hex)   -- → reason | nil, bytes
@@ -240,7 +296,19 @@ local function cmd_exec(cmd, base, require_sig)
     local list = valid_bases(cmd.value)
     if not list then return false, "bad bases" end
     if not kv_set("bases", table.concat(list, ",")) then return false, "fskv" end
-    clear_boot(); sys.timerStart(rtos.reboot, 5000); return true, "rebooting"
+    -- Provisional until it answers: see BASES_TRIES above. kv_forget (not a bare del) so that a
+    -- del that silently fails cannot leave bases_ok="1" behind and make the new override born
+    -- already-confirmed — the tombstone "" reads as "not confirmed".
+    kv_forget("bases_ok"); kv_forget("bases_try")
+    -- Do NOT mark the override active for the rest of THIS boot. The next boot re-reads fskv, and
+    -- until the reboot lands gw.lua's poller is still hitting the OLD base list; a 200 from there
+    -- must not confirm the brand-new override, so leave gw_alive a no-op until we come back up.
+    ovr_active, ovr_ok = false, false
+    -- Rescue-issued `bases`: keep boot_fail>=3 so the next boot is rescue too and can confirm the
+    -- new domain on its very first poll. Clearing it would run the broken gw.lua that caused rescue,
+    -- which crash-loops and spends the override's tries before anything ever reaches the new domain.
+    if not rescue_mode then clear_boot() end
+    sys.timerStart(rtos.reboot, 5000); return true, "rebooting"
   elseif t == "ota" then
     local err, n = ota_fetch(base, cmd.name, cmd.hmac)
     if err then return false, err end
@@ -249,6 +317,10 @@ local function cmd_exec(cmd, base, require_sig)
   return false, "bad type"
 end
 _G.gw_cmd = {}
+-- "#url reset" clears the override AND both markers. main.lua owns this state, so gw.lua's own
+-- "#url reset" calls through here (it falls back to deleting just "bases" only if this is absent) —
+-- one definition of what "reset" means, and no stale bases_ok left for the next override to inherit.
+function _G.gw_cmd.url_reset() bases_forget() end
 function _G.gw_cmd.run(cmd, base)
   if type(cmd) ~= "table" then return false, "bad cmd" end
   local id = tonumber(cmd.id)
@@ -308,8 +380,16 @@ end
 --           boot reverts the copies. Flashed code with no network: nothing — an outage must not
 --           reboot-loop a healthy device.
 --   rescue: retry a normal boot after 5 min AND one answered poll, else after 15 min regardless.
-local up_ms, alive, cleared, rescue_mode = 0, false, false, false
-function _G.gw_alive() alive = true end
+local up_ms, alive, cleared = 0, false, false   -- rescue_mode is declared up top (cmd_exec reads it)
+function _G.gw_alive()
+  alive = true
+  -- The Worker answered, so whatever domain we reached it on works. Pin the override.
+  if ovr_active and not ovr_ok then
+    ovr_ok = true
+    kv_set("bases_ok", "1"); pcall(fskv.del, "bases_try")
+    log.info("main", "bases override confirmed")
+  end
+end
 sys.timerLoopStart(function()
   up_ms = up_ms + HEALTH_TICK
   if rescue_mode then
@@ -349,7 +429,7 @@ local function rescue(num, txt)
     reply(num, string.format("RESCUE boot_fail=%d ota=%s fw=%s ver=%s dev=%s",
       tonumber(kv_get("boot_fail")) or boot_fail, _G.gw_ota.active(), fok and tostring(fw) or "-", VERSION, dev_id))
   elseif cmd == "reboot" then clear_boot(); rtos.reboot()   -- deliberate, like gw.lua's reboot_now
-  elseif cmd == "url" and rest:lower() == "reset" then pcall(fskv.del, "bases"); clear_boot(); rtos.reboot()
+  elseif cmd == "url" and rest:lower() == "reset" then bases_forget(); clear_boot(); rtos.reboot()
   elseif cmd == "url" then
     -- Unsigned on purpose — owner-gated, and the way back when the web cannot be reached.
     local ok, d = _G.gw_cmd.url(rest)
@@ -410,9 +490,11 @@ if boot_fail >= 3 then
   local function rescue_poll()
     local code, body, base = first_2xx("GET", "/api/poll?dev=" .. dev_id, nil, nil, 15000)
     if code ~= 200 then log.warn("main", "rescue: poll failed", code); return end
-    _G.gw_alive()
     local ok, t = pcall(json.decode, body)
-    if not ok or type(t) ~= "table" then return end
+    if not ok or type(t) ~= "table" or type(t.status) ~= "string" then return end
+    -- Only now: our Worker answered (a JSON status object), not just any 200 — a parked-domain
+    -- landing page or captive portal answers 200 too, and this call confirms the bases override.
+    _G.gw_alive()
     log.info("main", "rescue: poll", t.status)
     local cmd = t.status == "trusted" and type(t.cmd) == "table" and t.cmd or nil
     local id = cmd and tonumber(cmd.id)

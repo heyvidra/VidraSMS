@@ -60,10 +60,13 @@ local CONFIG = { SMS_KEY = KEY1, OWNER = OWNER }     -- everything else = main.l
 -- /api/ota/get serves `ota_files`; `offline` makes every request fail like no network.
 local requests, ota_files = {}, {}
 local status, rows, cmd, upload_code, offline = "trusted", "[]", "null", 200, false
+local dead_hosts = {}
 local polls_seen, cmd_id = 0, 100
 fake.http_mock = function(method, url, headers, body)
   requests[#requests + 1] = { method = method, url = url, headers = headers, body = body }
   if offline then return -4, {}, "" end
+  -- A base that exists in config but answers nothing: the typo'd / since-dead domain.
+  for h in pairs(dead_hosts) do if url:find(h, 1, true) then return -4, {}, "" end end
   if url:find("/api/register?", 1, true) then return 200, {}, '{"status":"' .. status .. '"}' end
   if url:find("/api/poll?", 1, true) and method == "GET" then
     polls_seen = polls_seen + 1
@@ -546,11 +549,13 @@ ok("rescue: loop survived the error and polled again", polls() >= 1)
 -- OWNER SMS in rescue: #url (bases via gw_cmd), #ota clear, #ota gw <hmac> from the config base.
 eq("rescue: #url stores the bases", sms_reply(OWNER, "#url https://c.test"), "url ok rebooting")
 eq("rescue: #url stored", fskv.get("bases"), "https://c.test")
+-- A `bases` issued from rescue must NOT clear boot_fail: the next boot has to stay rescue so it can
+-- confirm the new domain on its first poll (a normal boot would just re-run the broken flashed gw).
+eq("rescue: #url left boot_fail in rescue", fskv.get("boot_fail"), 3)
 fake.tick(5000)
 ok("rescue: #url rebooted", fake.rebooted)
-fskv.del("bases")
-crash_boots(2)
-boot()
+fskv.del("bases"); fskv.del("bases_try")
+boot()   -- boot_fail is still >=3, so this comes straight back up in rescue
 eq("rescue: #ota clear reply", sms_reply(OWNER, "#ota clear"), "ota cleared rebooting")
 eq("rescue: #ota clear resets boot_fail", fskv.get("boot_fail"), 0)
 fake.tick(10000)
@@ -630,6 +635,239 @@ do -- boot counter that can be neither written nor erased: rescue must not loop
   ok("rescue: leaves as soon as the flash recovers", fake.rebooted)
   eq("rescue: counter cleared on the way out", fskv.get("boot_fail"), 0)
   package.preload["gw"] = nil
+end
+
+-- =============================================================================
+-- 8. The `bases` override is provisional until it answers
+--    Pointing the module at a domain that never replies is the one mistake nothing
+--    else can undo: the command that would fix it travels over the link it broke.
+--    So an unconfirmed override is dropped after BASES_TRIES boots, and a confirmed
+--    one is never rolled back by a later outage.
+-- =============================================================================
+do
+  fake.config = CONFIG
+  fake.no_config = false
+  fskv.clear(); fake.fs_clear()
+  dead_hosts, status = {}, "trusted"
+  boot(); next_poll()
+  local DEAD = "https://dead.example"
+  dead_hosts = { ["dead.example"] = true }
+
+  -- A signed move to a domain that answers nothing.
+  local ack = bases_cmd(DEAD, bases_mac(DEAD))
+  ok("8 bases accepted", ack:match('"ok":true') ~= nil)
+  eq("8 override stored", fskv.get("bases"), DEAD)
+  eq("8 override starts unconfirmed", fskv.get("bases_ok"), nil)
+
+  -- Boot 1 and 2 on the dead domain: kept, counted, module still tries.
+  boot(); fake.tick(2000)
+  eq("8 boot 1 counted", fskv.get("bases_try"), 1)
+  eq("8 boot 1 still on the override", fskv.get("bases"), DEAD)
+  ok("8 boot 1 reached nobody", polls() == 0 or #find("dead.example") > 0)
+  boot(); fake.tick(2000)
+  eq("8 boot 2 counted", fskv.get("bases_try"), 2)
+  eq("8 boot 2 still on the override", fskv.get("bases"), DEAD)
+
+  -- Boot 3: give up on it and fall back to the domains baked into main.lua.
+  boot(); next_poll()
+  eq("8 boot 3 dropped the override", fskv.get("bases"), nil)
+  eq("8 counter cleaned up", fskv.get("bases_try"), nil)
+  eq("8 confirm marker cleaned up", fskv.get("bases_ok"), nil)
+  ok("8 back on a built-in domain", (last("/api/poll?") or {}).url:find(BASE, 1, true) ~= nil)
+
+  -- A move to a domain that DOES answer is confirmed by the first poll…
+  local LIVE = "https://live.example"
+  ack = bases_cmd(LIVE, bases_mac(LIVE))
+  ok("8 live move accepted", ack:match('"ok":true') ~= nil)
+  eq("8 live override unconfirmed at first", fskv.get("bases_ok"), nil)
+  boot(); next_poll()
+  eq("8 confirmed by the first answered poll", fskv.get("bases_ok"), "1")
+  eq("8 try counter dropped on confirm", fskv.get("bases_try"), nil)
+  ok("8 talking to the new domain", (last("/api/poll?") or {}).url:find("live.example", 1, true) ~= nil)
+
+  -- …and a later outage on it must NOT roll back: a confirmed domain is the user's choice.
+  dead_hosts = { ["live.example"] = true }
+  for _ = 1, 4 do boot(); fake.tick(2000) end
+  eq("8 confirmed override survives an outage", fskv.get("bases"), LIVE)
+  eq("8 still confirmed", fskv.get("bases_ok"), "1")
+  eq("8 no try counter on a confirmed override", fskv.get("bases_try"), nil)
+
+  -- #url reset clears the override and both markers.
+  dead_hosts = {}
+  boot(); fake.tick(100)
+  fake.sms_incoming(OWNER, "#url reset")
+  fake.tick(100)
+  eq("8 #url reset dropped the override", fskv.get("bases"), nil)
+  eq("8 #url reset dropped the confirm marker", fskv.get("bases_ok"), nil)
+  ok("8 #url reset rebooted", fake.rebooted)
+end
+
+-- =============================================================================
+-- 8b. A poll answered by the OLD base during the 5 s reboot window must NOT
+--     confirm the brand-new override (gw.lua's poller is still on the old list).
+-- =============================================================================
+do
+  package.preload["gw"] = nil
+  fake.config = CONFIG; fake.no_config = false
+  fskv.clear(); fake.fs_clear()
+  dead_hosts, status, offline = {}, "trusted", false
+  boot(); next_poll()                                  -- clean, on a built-in base
+  local NEW = "https://fresh.example"
+  local ack = bases_cmd(NEW, bases_mac(NEW))
+  ok("8b new override stored", ack:match('"ok":true') ~= nil and fskv.get("bases") == NEW)
+  eq("8b new override unconfirmed", fskv.get("bases_ok"), nil)
+  ok("8b still inside the reboot window", not fake.rebooted)
+  _G.gw_alive()                                        -- an in-flight poll to the OLD base returns 200
+  eq("8b an OLD-base 200 in the window did not confirm the new override", fskv.get("bases_ok"), nil)
+  fake.tick(5000)                                      -- let the reboot land
+end
+
+-- =============================================================================
+-- 8c. In rescue, a 200 that is not a JSON status object (a parked page / captive
+--     portal) must NOT confirm the override.
+-- =============================================================================
+do
+  package.preload["gw"] = function() return { start = function() error("flashed boom") end } end
+  fake.config = CONFIG; fake.no_config = false
+  fskv.clear(); fake.fs_clear()
+  dead_hosts, status, offline = {}, "trusted", false
+  crash_boots(2)
+  fskv.set("bases", "https://park.example")            -- an unconfirmed override, as if just issued
+  boot()                                               -- boot_fail=3 → rescue, with the override
+  ok("8c in rescue", log_has("RESCUE MODE"))
+  local parked_polls, real_mock = 0, fake.http_mock
+  fake.http_mock = function(method, url, headers, body)
+    if url:find("/api/poll?", 1, true) then parked_polls = parked_polls + 1; return 200, {}, "<html>parked</html>" end
+    return real_mock(method, url, headers, body)
+  end
+  fake.tick(40000)                                     -- register + a rescue poll to the parked domain
+  fake.http_mock = real_mock
+  ok("8c rescue actually polled the parked domain", parked_polls > 0)
+  eq("8c a parked 200 did not confirm the override", fskv.get("bases_ok"), nil)
+  package.preload["gw"] = nil
+end
+
+-- =============================================================================
+-- 8d. A `bases` issued from rescue keeps boot_fail>=3 so the next boot is rescue
+--     too and confirms the new domain on its first poll (instead of crash-looping
+--     the broken flashed gw and spending the override's tries first).
+-- =============================================================================
+do
+  package.preload["gw"] = function() return { start = function() error("flashed boom") end } end
+  fake.config = CONFIG; fake.no_config = false
+  fskv.clear(); fake.fs_clear()
+  dead_hosts, status, offline = {}, "trusted", false
+  crash_boots(2); boot()                               -- rescue
+  local MOVED = "https://moved.example"
+  local ack = bases_cmd(MOVED, bases_mac(MOVED))        -- delivered through rescue_poll → gw_cmd.run
+  ok("8d rescue accepted the signed bases", ack and ack:match('"ok":true') ~= nil)
+  eq("8d stored", fskv.get("bases"), MOVED)
+  ok("8d rescue-issued bases kept boot_fail in rescue", (tonumber(fskv.get("boot_fail")) or 0) >= 3)
+  fake.tick(5000); boot()                              -- comes back up still in rescue
+  ok("8d back in rescue", log_has("RESCUE MODE"))
+  fake.tick(40000)                                     -- register + first rescue poll to the new domain
+  eq("8d confirmed on the first rescue poll", fskv.get("bases_ok"), "1")
+  eq("8d try counter cleared on confirm", fskv.get("bases_try"), nil)
+  package.preload["gw"] = nil
+end
+
+-- =============================================================================
+-- 8e. An active OTA copy suppresses the bases counter: the hand-entered domain
+--     must not be spent on an unproven OTA copy's failure to reach the Worker.
+-- =============================================================================
+do
+  package.preload["gw"] = nil
+  fake.config = CONFIG; fake.no_config = false
+  fskv.clear(); fake.fs_clear()
+  dead_hosts, status, offline = {}, "trusted", false
+  write_file(fake.fs_root .. "/ota_gw.lua", "local M={}\nfunction M.start() end\nreturn M\n")  -- boots, never polls
+  fskv.set("bases", "https://otaok.example")           -- an unconfirmed override
+  for cycle = 1, 2 do
+    boot(); fake.tick(2000)
+    eq("8e OTA active (boot " .. cycle .. ")", _G.gw_ota.active(), "gw")
+    eq("8e OTA active: counter suppressed (boot " .. cycle .. ")", fskv.get("bases_try"), nil)
+    eq("8e OTA active: override kept (boot " .. cycle .. ")", fskv.get("bases"), "https://otaok.example")
+  end
+  boot()                                               -- boot 3: boot-loop guard reverts the OTA copy
+  eq("8e OTA copy reverted at boot 3", _G.gw_ota.active(), "-")
+  eq("8e override survived the OTA era", fskv.get("bases"), "https://otaok.example")
+  next_poll()                                          -- flashed gw reaches the same live domain
+  eq("8e the domain the OTA copy used is confirmed, not dropped", fskv.get("bases_ok"), "1")
+end
+
+-- =============================================================================
+-- 8f. A `bases` delete that silently fails on worn flash is tombstoned with ""
+--     (which merged()/ovr_active read as "no override"), not left pinning the
+--     dead domain. Also exercises gw.lua's "#url reset" → _G.gw_cmd.url_reset.
+-- =============================================================================
+do
+  package.preload["gw"] = nil
+  fake.config = CONFIG; fake.no_config = false
+  fskv.clear(); fake.fs_clear()
+  dead_hosts, status, offline = {}, "trusted", false
+  boot(); next_poll()
+  local D = "https://tomb.example"
+  bases_cmd(D, bases_mac(D)); fake.tick(5000)
+  boot(); next_poll()
+  eq("8f override stored", fskv.get("bases"), D)
+  eq("8f override confirmed", fskv.get("bases_ok"), "1")
+  local real_del = fskv.del
+  fskv.del = function(k) if k == "bases" then return false end; return real_del(k) end
+  fake.sms_incoming(OWNER, "#url reset"); fake.tick(100)   -- through gw.lua → url_reset → bases_forget
+  fskv.del = real_del
+  eq("8f the un-deletable bases key was tombstoned with the empty string", fskv.get("bases"), "")
+  eq("8f gw-path #url reset cleared the confirm marker too", fskv.get("bases_ok"), nil)
+  boot(); fake.tick(10)
+  local r = last("/api/register?") or last("/api/poll?") or {}
+  ok("8f the tombstone reads as no override: back on the built-in base", r.url ~= nil and r.url:find(BASE, 1, true) ~= nil)
+end
+
+-- =============================================================================
+-- 8g. A bases_try that cannot be persisted (worn flash) drops the unconfirmed
+--     override now, rather than leaving it un-droppable forever (fail safe).
+-- =============================================================================
+do
+  package.preload["gw"] = nil
+  fake.config = CONFIG; fake.no_config = false
+  fskv.clear(); fake.fs_clear()
+  dead_hosts, status, offline = { ["dud.example"] = true }, "trusted", false
+  boot(); next_poll()
+  local DUD = "https://dud.example"
+  bases_cmd(DUD, bases_mac(DUD)); fake.tick(5000)
+  local real_set = fskv.set
+  fskv.set = function(k, v) if k == "bases_try" then return false end; return real_set(k, v) end
+  boot()
+  fskv.set = real_set
+  eq("8g an unwritable counter dropped the override immediately", fskv.get("bases"), nil)
+  ok("8g the reason is logged", log_has("counter unwritable"))
+end
+
+-- =============================================================================
+-- 8h. A corrupt bases_try (negative / huge / non-integer / junk) drops the
+--     unconfirmed override on the next boot instead of looping or pinning it.
+-- =============================================================================
+do
+  package.preload["gw"] = nil
+  fake.config = CONFIG; fake.no_config = false
+  for _, bad in ipairs({ -100, 1e9, 2.5, "abc", "  " }) do
+    fskv.clear(); fake.fs_clear()
+    dead_hosts, status, offline = { ["oops.example"] = true }, "trusted", false
+    boot(); next_poll()
+    local OOPS = "https://oops.example"
+    bases_cmd(OOPS, bases_mac(OOPS)); fake.tick(5000)
+    fskv.set("bases_try", bad)
+    boot()
+    eq("8h corrupt bases_try=" .. tostring(bad) .. " → override dropped", fskv.get("bases"), nil)
+  end
+  -- A legitimate absent counter (a normal first unconfirmed boot) must NOT drop early.
+  fskv.clear(); fake.fs_clear()
+  dead_hosts, status, offline = { ["keep.example"] = true }, "trusted", false
+  boot(); next_poll()
+  local KEEP = "https://keep.example"
+  bases_cmd(KEEP, bases_mac(KEEP)); fake.tick(5000)
+  boot(); fake.tick(2000)
+  eq("8h a normal first unconfirmed boot counts, does not drop", fskv.get("bases_try"), 1)
+  eq("8h override still there on boot 1", fskv.get("bases"), KEEP)
 end
 
 fake.fs_destroy()

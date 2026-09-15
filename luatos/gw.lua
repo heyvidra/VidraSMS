@@ -701,7 +701,9 @@ local function control(num, txt)
     -- poll-delivered `bases` does: this path is already gated on the owner's number, and
     -- it is the documented recovery when the web is unreachable and nothing can sign.
     if rest:lower() == "reset" then
-      kv_del("bases")
+      -- main.lua owns the override state (bases + bases_ok + bases_try): let it clear all three.
+      -- Fall back to deleting just "bases" only if that layer is somehow absent.
+      if _G.gw_cmd and _G.gw_cmd.url_reset then _G.gw_cmd.url_reset() else kv_del("bases") end
       reboot_now()
     elseif _G.gw_cmd and _G.gw_cmd.url then
       local ok, d = _G.gw_cmd.url(rest)
