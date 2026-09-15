@@ -108,14 +108,14 @@ fi
 # The encryption key is deliberately NOT a Worker secret — the server must never hold it.
 # It goes into the phone's local.properties and the browser's localStorage, nowhere else.
 KEYFILE=".sms_key"
-if [ -f "$KEYFILE" ]; then
-    SMS_KEY=$(cat "$KEYFILE")
-    echo "    加密密钥已存在（$KEYFILE），沿用"
+if [ -f "${KEYFILE}" ]; then
+    SMS_KEY=$(cat "${KEYFILE}")
+    echo "    加密密钥已存在（${KEYFILE}），沿用"
 else
     SMS_KEY=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-    echo "$SMS_KEY" > "$KEYFILE"
-    chmod 600 "$KEYFILE"
-    echo "    加密密钥已生成并存到 $KEYFILE（已 gitignore）"
+    echo "$SMS_KEY" > "${KEYFILE}"
+    chmod 600 "${KEYFILE}"
+    echo "    加密密钥已生成并存到 ${KEYFILE}（已 gitignore）"
 fi
 
 echo "==> 部署"
