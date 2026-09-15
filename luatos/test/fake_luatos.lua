@@ -364,6 +364,15 @@ function http.request(method, url, headers, body, opts, ca)
   local code, rh, rb
   if fake.http_mock then
     code, rh, rb = fake.http_mock(method, url, headers or {}, body, opts)
+  elseif not tostring(url):find("^https?://127%.0%.0%.1[:/]") and
+         not tostring(url):find("^https?://localhost[:/]") then
+    -- A test rig must never be able to reach the real world. This fired for real once: a
+    -- config.lua sitting in luatos/ shadowed the throwaway one the harness writes, the module
+    -- fell back to main.lua's baked-in production domains, and the "local" run registered
+    -- itself against the live Worker. Refuse the request instead of making it, and say why.
+    io.stderr:write("fake_luatos: REFUSED non-local request " .. tostring(method) .. " " ..
+                    tostring(url) .. " — the harness must only talk to 127.0.0.1\n")
+    code, rh, rb = -4, {}, ""
   else
     code, rh, rb = curl(method, url, headers, body, opts and opts.timeout)
   end

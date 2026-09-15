@@ -873,7 +873,11 @@ export default {
               headers: { "Content-Type": "application/json" },
             });
       }
-      const res = path === "/" ? html(PAGE) : await handleList(request, env);
+      // The deploy timestamp is a binding, not a constant, so the page shows when the Worker
+      // actually shipped rather than whatever someone last remembered to edit.
+      const res = path === "/"
+        ? html(PAGE.replace("__BUILT__", env.CF_VERSION_METADATA?.timestamp || ""))
+        : await handleList(request, env);
       return request.method === "HEAD"
         ? new Response(null, { status: res.status, headers: res.headers })
         : res;
@@ -1181,6 +1185,8 @@ const LIST_CSS = `
   backdrop-filter:saturate(1.6) blur(12px);border-bottom:1px solid var(--line);
 }
 .top h1{font-size:15px;font-weight:650;margin:0;white-space:nowrap}
+.top .who{display:flex;flex-direction:column;gap:2px;min-width:0}
+.top .ver{font-size:11px;line-height:1;color:var(--muted);white-space:nowrap}
 .dot{width:7px;height:7px;border-radius:50%;background:#22c55e;flex:none}
 .dot.bad{background:var(--danger)}
 .spacer{flex:1}
@@ -1235,6 +1241,9 @@ li.fresh{background:var(--fresh);border-color:var(--fresh-line)}
    wraps instead of ellipsising, and the card widens a little to give it room. */
 .dev-warn{color:var(--danger);font-weight:600;white-space:normal;line-height:1.35}
 .dev-cap{color:#22c55e;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* A module's IMEI/ICCID and 脚本/固件/ota lines: these are exactly what you read to tell two
+   boards apart and to decide what to push, so they wrap rather than ellipsise. */
+.dev-id{font-size:11.5px;color:var(--muted);margin-top:2px;padding-left:15px;white-space:normal;line-height:1.4;overflow-wrap:anywhere}
 /* Self-registered modules. A pending card is the one thing on the strip that wants a click, so it
    gets the amber ring the rest of the page never uses; blocked is deliberately dull. */
 .dev.pend{border-color:#f59e0b;box-shadow:0 0 0 2px rgba(245,158,11,.28)}
@@ -1376,7 +1385,7 @@ const PAGE = `<!doctype html>
 </head><body>
 <header class="top">
   <span class="dot" id="dot"></span>
-  <h1>短信转发</h1>
+  <div class="who"><h1>短信转发</h1><span class="ver" id="ver"></span></div>
   <span class="spacer"></span>
   <button class="out" id="sendBtn" type="button">发短信</button>
   <button class="out" id="balBtn" type="button">话费</button>
@@ -1482,6 +1491,18 @@ let maxId = 0, unread = 0, first = true;
 const INBOX = new Map();  // id -> {id, ts, number, sender, body}
 let SENT = [];            // [{id, ts, number, to, body, status, detail}]
 const norm = (x) => String(x || "").replace(/[^0-9+]/g, "");  // [0-9] not \\d — template-safe
+
+// Stamped per deploy from the version_metadata binding, so it can never go stale the way a
+// hand-bumped version string does. Empty only if the binding is missing (old wrangler.toml).
+(() => {
+  const iso = "__BUILT__";
+  const el = document.getElementById("ver");
+  const d = iso ? new Date(iso) : null;
+  if (!el || !d || isNaN(d)) return;
+  const p = (n) => String(n).padStart(2, "0");
+  el.textContent = "发布于 " + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes());
+  el.title = d.toLocaleString();
+})();
 
 function when(ms){
   const d = new Date(ms), diff = (Date.now() - ms) / 1000;
@@ -2107,7 +2128,7 @@ async function renderBeat(){
     }
     // System version (Android + ColorOS/…): reported by the phone so the ROM is visible from here
     // — needed to tell a device what its exact keep-alive/permission settings paths are.
-    if (d.os) {
+    if (d.os && !d.module) {
       const o = document.createElement("div"); o.className = "dev-sims";
       o.textContent = String(d.os);
       sub.append(o);
@@ -2170,7 +2191,7 @@ async function renderBeat(){
     // Footer row: the app version (left) and, watermarked bottom-right, the connection type the
     // phone last reported — "WIFI"/"4G"/"5G"/… . No emoji, muted; the label alone says whether it
     // is on Wi-Fi or burning the SIM's data. Legacy v1.5 phones send "cell" (no generation) → 蜂窝.
-    if (d.ver || d.tr) {
+    if ((d.ver || d.tr) && !d.module) {
       const net = d.tr === "cell" ? "蜂窝" : (d.tr || "");
       const line = document.createElement("div"); line.className = "dev-net";
       line.textContent = [net, d.ver ? "v" + d.ver : ""].filter(Boolean).join(" · ");
@@ -2184,14 +2205,17 @@ async function renderBeat(){
       // deciding whether to push an update or just reboot.
       const idl = [d.imei ? "IMEI …" + String(d.imei).slice(-6) : "", d.iccid ? "ICCID …" + String(d.iccid).slice(-6) : ""].filter(Boolean);
       if (idl.length) {
-        const l = document.createElement("div"); l.className = "dev-sims";
+        const l = document.createElement("div"); l.className = "dev-id";
         l.textContent = idl.join(" · "); l.title = l.textContent;
         sub.append(l);
       }
-      const swl = [d.fw ? "固件 " + d.fw : "", d.sver ? "脚本 " + d.sver : "", d.ota ? "ota " + d.ota : "",
-        d.boot != null && d.boot !== "" ? "重启计数 " + d.boot : ""].filter(Boolean);
+      const swl = [d.sver ? "脚本 " + d.sver : "", d.fw ? "固件 " + d.fw : "",
+        // Both of these are only worth the width when they are NOT the healthy value: an active
+        // OTA copy, or a module that has been failing to boot.
+        d.ota && d.ota !== "-" ? "ota " + d.ota : "",
+        Number(d.boot) > 0 ? "重启 " + d.boot : ""].filter(Boolean);
       if (swl.length) {
-        const l = document.createElement("div"); l.className = "dev-sims";
+        const l = document.createElement("div"); l.className = "dev-id";
         l.textContent = swl.join(" · "); l.title = l.textContent;
         sub.append(l);
       }

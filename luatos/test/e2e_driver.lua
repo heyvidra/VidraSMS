@@ -23,9 +23,13 @@
 local here = debug.getinfo(1, "S").source:match("^@(.*)/[^/]*$") or "."
 package.path = here .. "/?.lua;" .. here .. "/../?.lua;" .. package.path
 local confdir = os.getenv("E2E_CONFDIR")
-if confdir then package.path = confdir .. "/?.lua;" .. package.path end
 
 local fake = require("fake_luatos")
+-- Load the harness's config EXPLICITLY rather than leaving it to package.path. Relying on the
+-- path let a real luatos/config.lua shadow the throwaway one (fake_luatos prepends luatos/ to
+-- the path after we do), so the module fell back to main.lua's baked-in production DEFAULTS and
+-- a "local" run registered itself against the live Worker. preload beats the path, always.
+if confdir then fake.config = assert(dofile(confdir .. "/config.lua")) end
 fake.quiet = (os.getenv("E2E_VERBOSE") ~= "1")
 fake.no_run = true            -- sys.run() returns; virtual time is driven below
 
