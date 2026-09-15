@@ -3,10 +3,12 @@
 -- the config (DEFAULTS ← config.lua ← fskv "bases"), mint the device identity,
 -- load gw.lua (or its OTA copy /ota_gw.lua) and keep the last line of defence
 -- the app can never take away: the boot-loop guard with its OTA revert, the
--- OTA installer, the web command runner (_G.gw_cmd) and a rescue mode that
--- still registers with the Worker and takes its commands when gw.lua cannot
--- start. Nothing is provisioned over SMS: SMS_KEY comes from config.lua, trust
--- is granted on the web. Needs nothing from gw.lua/gcm.lua at load time.
+-- OTA installer, the web command runner (_G.gw_cmd), the signed-SMS command
+-- channel and a rescue mode that still registers with the Worker and takes its
+-- commands when gw.lua cannot start. Nothing is provisioned over SMS: SMS_KEY
+-- comes from config.lua, trust is granted on the web, and the SMS commands are
+-- authenticated with that same key — there is no phone number to configure.
+-- Needs nothing from gw.lua/gcm.lua at load time.
 PROJECT = "smsgw"
 VERSION = "2.0.0"
 sys = require("sys")
@@ -27,12 +29,6 @@ local function clear_boot()   -- → true when the counter is back to 0 (del whe
   if kv_set("boot_fail", 0) then return true end
   pcall(fskv.del, "boot_fail")
   return (tonumber(kv_get("boot_fail")) or 0) == 0
-end
-local function digits(s) return (tostring(s == nil and "" or s):gsub("%D", "")) end
--- gw.lua's M.is_owner (last 11 digits), duplicated: must work with gw.lua broken.
-local function is_owner(num, owner)
-  local a, b = digits(num), digits(owner)
-  return a ~= "" and b ~= "" and a:sub(-11) == b:sub(-11)
 end
 -- sms.send returns nil while the modem still owes an SMS_SENT: retry once after 50 s.
 local function reply(num, text)
@@ -272,7 +268,8 @@ end
 -- with (ok, detail) — before the reboot, which is on a timer. A cmd whose id is the last one
 -- acked is answered from fskv and not run again (the ack got lost; the Worker re-served it).
 -- require_sig is true for anything that arrived over the network: `bases` then has to carry an
--- HMAC-SHA256 under SMS_KEY. It is false only on the OWNER's "#url" SMS (see _G.gw_cmd.url).
+-- HMAC-SHA256 under SMS_KEY. It is false only on the "#url" SMS (see url_cmd), which carries
+-- its own signature over the whole message under the very same key.
 local function cmd_exec(cmd, base, require_sig)
   local t = cmd.type
   if t == "reboot" then
@@ -317,10 +314,6 @@ local function cmd_exec(cmd, base, require_sig)
   return false, "bad type"
 end
 _G.gw_cmd = {}
--- "#url reset" clears the override AND both markers. main.lua owns this state, so gw.lua's own
--- "#url reset" calls through here (it falls back to deleting just "bases" only if this is absent) —
--- one definition of what "reset" means, and no stale bases_ok left for the next override to inherit.
-function _G.gw_cmd.url_reset() bases_forget() end
 function _G.gw_cmd.run(cmd, base)
   if type(cmd) ~= "table" then return false, "bad cmd" end
   local id = tonumber(cmd.id)
@@ -336,24 +329,31 @@ function _G.gw_cmd.run(cmd, base)
   if id then kv_set("last_cmd", id); kv_set("last_cmd_res", (okr and "ok:" or "fail:") .. detail) end
   return okr, detail
 end
--- The OWNER's "#url <list>" SMS, and nothing else, sets `bases` WITHOUT a signature. That is
--- deliberate: the path is already gated on the owner's number from config.lua, and it is the
--- documented recovery when the web is unreachable — a wrong `bases`, a dead Worker, no browser
--- to sign with. Its only two callers are rescue() below and gw.lua's "#url" control handler;
--- a poll-delivered command can never get here, it goes through _G.gw_cmd.run, which requires
--- the HMAC. Keep it that way: an unsigned `bases` reachable from the network is a permanent
--- capture of the module.
-function _G.gw_cmd.url(value)
+-- The "#url <list>" SMS sets `bases` without the separate "bases\n<value>" signature the
+-- poll path requires: the whole SMS is already signed under SMS_KEY (sms_cmd below), so a
+-- second MAC over the same bytes under the same key would prove nothing new. It is a LOCAL
+-- on purpose — sms_cmd is its only caller, so the one unsigned-`bases` entry point in this
+-- firmware is not reachable from anything that came off the network. A poll-delivered
+-- command goes through _G.gw_cmd.run, which requires the HMAC. Keep it that way: an
+-- unsigned `bases` reachable from the network is a permanent capture of the module.
+local function url_cmd(value)
   local ok, okr, detail = pcall(cmd_exec, { type = "bases", value = value }, nil, false)
   if not ok then okr, detail = false, "error " .. tostring(okr) end
   detail = tostring(detail == nil and "" or detail):sub(1, 200)
   log.info("main", "cmd", "-", "url", okr and "ok" or "fail", detail)
   return okr, detail
 end
--- "#ota gw|gcm <hmac>" by SMS: same download + install, replied to the sender.
-function _G.gw_ota.install(name, hmac_hex, base, reply_to)
+-- "#ota gw|gcm <hmac>" by SMS: same download + install, replied to the sender. Every
+-- configured base is tried, because this channel is used precisely when one of them is
+-- unreachable; only a download failure ("http …") is worth another base — a bad hmac or a
+-- script that will not compile fails the same way everywhere.
+function _G.gw_ota.install(name, hmac_hex, reply_to)
   sys.taskInit(function()
-    local ok, d = _G.gw_cmd.run({ type = "ota", name = name, hmac = hmac_hex }, base)
+    local ok, d = false, "no base"
+    for _, b in ipairs(split_bases(merged().BASES)) do
+      ok, d = _G.gw_cmd.run({ type = "ota", name = name, hmac = hmac_hex }, b)
+      if ok or tostring(d):sub(1, 5) ~= "http " then break end
+    end
     if ok then log.info("main", "ota", name, "installed", d) else log.error("main", "ota", name, d) end
     reply(reply_to, ok and ("ota ok " .. name .. " " .. d .. " rebooting") or ("ota fail: " .. d))
   end)
@@ -417,33 +417,101 @@ if boot_fail >= 3 and _G.gw_ota.active() ~= "-" then
   ota_remove(); boot_fail = 0; clear_boot()
   log.error("main", "ota reverted after 3 failed boots")
 end
--- Owner-only # commands answered by main.lua itself: all of rescue mode, and the fallback
--- whenever the app has not registered an SMS handler. Nothing without OWNER in config.lua.
-local function rescue(num, txt)
-  local cmd, rest = txt:match("^#(%a+)%s*(.-)%s*$")
-  cmd = cmd and cmd:lower()
-  local c = merged()
-  if not cmd or type(c.OWNER) ~= "string" or not is_owner(num, c.OWNER) then return end
-  if cmd == "status" then
-    local fok, fw = pcall(rtos.version)
-    reply(num, string.format("RESCUE boot_fail=%d ota=%s fw=%s ver=%s dev=%s",
-      tonumber(kv_get("boot_fail")) or boot_fail, _G.gw_ota.active(), fok and tostring(fw) or "-", VERSION, dev_id))
-  elseif cmd == "reboot" then clear_boot(); rtos.reboot()   -- deliberate, like gw.lua's reboot_now
-  elseif cmd == "url" and rest:lower() == "reset" then bases_forget(); clear_boot(); rtos.reboot()
-  elseif cmd == "url" then
-    -- Unsigned on purpose — owner-gated, and the way back when the web cannot be reached.
-    local ok, d = _G.gw_cmd.url(rest)
-    reply(num, ok and "url ok rebooting" or ("url fail: " .. d))
-  elseif cmd == "ota" and rest:lower() == "clear" then _G.gw_ota.clear(num)
-  elseif cmd == "ota" then
-    local name, mac = rest:match("^(%S+)%s+(%S+)$")
-    if name then _G.gw_ota.install(name, mac, split_bases(c.BASES)[1], num) else reply(num, OTA_USAGE) end
-  end
+-- ---- signed SMS commands ----------------------------------------------------
+-- The break-glass channel: the only way in when the Worker or the domain cannot be reached
+-- at all, and it lives here, in the layer that is never updated over the air, so that it
+-- still works with gw.lua broken or absent (rescue mode).
+--
+-- One SMS, ASCII, "<body> <mac>": body is the command (#status, #reboot, #url …, #ota …)
+-- and mac is the FIRST 16 hex chars of HMAC-SHA256("sms\n" .. body) under SMS_KEY — the key
+-- config.lua already carries and the same key the web's `ota`/`bases` buttons sign with. No
+-- phone number is configured and no number is trusted: a caller ID is trivially spoofable,
+-- a MAC is not. 16 hex = 64 bits, and a forgery costs one SMS per guess against a device
+-- that answers slowly, so the short tag is ample; a variable-length mac is NOT accepted.
+--
+-- Anything that does not verify — no mac, a wrong mac, a mac for a different body, a `#`
+-- from anyone at all — is forwarded as an ordinary SMS and never answered: the probe shows
+-- up on the web page instead of turning the module into an oracle (and costs no SMS).
+--
+-- Replay is accepted and deliberate: a captured command can be resent, so it can only
+-- re-apply something the owner once authorised. A replayed `#url` is further blunted by the
+-- commit-confirm above (a since-dead domain is dropped again within ~20–30 min). That is
+-- the same residual the web `bases`/`ota` signatures carry.
+_G.gw_status_line = nil   -- only the gw.lua of THIS boot may install the rich #status line
+
+-- The ONE canonical form, matched byte-for-byte by luatos/sms-sign.sh: trim the whole
+-- message, split off the last whitespace-separated token as the mac, trim what is left.
+-- Sign exactly the bytes that are compared.
+local function sms_split(txt)
+  local s = txt:gsub("^%s+", ""):gsub("%s+$", "")
+  local body, mac = s:match("^(.-)%s+(%S+)$")
+  if not body then return nil end
+  return (body:gsub("^%s+", ""):gsub("%s+$", "")), mac
 end
--- main.lua owns the real SMS callback for good. The app's handler runs through
--- it, but the owner's "#ota clear" is always taken here and every "#" command
--- falls back to `rescue` while no app handler exists — an OTA gw that starts
--- but never serves SMS cannot cut the owner off.
+-- Fixed length, fixed alphabet, no early exit: a wrong guess leaks nothing but "wrong".
+local function mac_eq(want, got)
+  if #want ~= 16 or #got ~= 16 then return false end
+  local diff = 0
+  for i = 1, 16 do diff = diff | (want:byte(i) ~ got:byte(i)) end
+  return diff == 0
+end
+local function sms_signed(body, mac)
+  if type(mac) ~= "string" or #mac ~= 16 or not mac:match("^%x+$") then return false end
+  local key32 = key32_of(merged())
+  if not key32 then return false end   -- no key: nothing can validate, everything is forwarded
+  local ok, full = pcall(crypto.hmac_sha256, "sms\n" .. body, key32)
+  if not (ok and type(full) == "string" and #full >= 16) then return false end
+  return mac_eq(full:sub(1, 16):lower(), mac:lower())
+end
+-- gw.lua publishes the rich line (queue depth, trust, signal — main.lua can see none of it)
+-- as _G.gw_status_line. Without it (rescue mode, or gw.lua died before it got that far)
+-- answer with what this layer knows by itself.
+local function status_text()
+  if type(_G.gw_status_line) == "function" then
+    local ok, line = pcall(_G.gw_status_line)
+    if ok and type(line) == "string" and line ~= "" then return line end
+  end
+  local fok, fw = pcall(rtos.version)
+  return string.format("RESCUE boot_fail=%d ota=%s fw=%s ver=%s dev=%s",
+    tonumber(kv_get("boot_fail")) or boot_fail, _G.gw_ota.active(), fok and tostring(fw) or "-", VERSION, dev_id)
+end
+-- → true when the message was a valid signed command: it has been executed and must NOT be
+-- forwarded. Everything else returns false and travels on to the app's handler.
+local function sms_cmd(num, txt)
+  local body, mac = sms_split(txt)
+  if not body or body:sub(1, 1) ~= "#" then return false end
+  if not sms_signed(body, mac) then
+    log.warn("main", "unsigned or wrongly signed # message from", num, "- forwarding it")
+    return false
+  end
+  local cmd, rest = body:match("^#(%a+)%s*(.-)%s*$")
+  if not cmd then log.warn("main", "signed but unparsable command", body); return true end
+  cmd = cmd:lower()
+  log.info("main", "sms cmd", cmd, rest)
+  if cmd == "status" then
+    reply(num, status_text())
+  elseif cmd == "reboot" then
+    clear_boot(); rtos.reboot()                              -- deliberate: not a failed boot
+  elseif cmd == "url" and rest:lower() == "reset" then
+    bases_forget(); clear_boot(); rtos.reboot()              -- drops the override AND both markers
+  elseif cmd == "url" then
+    local ok, d = url_cmd(rest)
+    reply(num, ok and "url ok rebooting" or ("url fail: " .. d))
+  elseif cmd == "ota" and rest:lower() == "clear" then
+    _G.gw_ota.clear(num)
+  elseif cmd == "ota" then
+    local name, hmac_hex = rest:match("^(%S+)%s+(%S+)$")
+    if name then _G.gw_ota.install(name, hmac_hex, num) else reply(num, OTA_USAGE) end
+  else
+    log.warn("main", "unknown sms command", cmd)
+  end
+  return true
+end
+
+-- main.lua owns the real SMS callback for good: every inbound message is offered to
+-- sms_cmd first, and only what it did not claim reaches the app's handler. So an OTA
+-- gw.lua that starts but never serves SMS — or never starts at all — cannot cut the
+-- owner off from the module.
 -- `sms` is a rotable userdata on stock firmware (luat_newlib2 → rotable2_newlib;
 -- its metatable has __index but NO __newindex), so `sms.setNewSmsCb = ...` would
 -- raise in the main chunk and brick every boot. Shadow the global with a plain
@@ -455,17 +523,19 @@ _G.sms = setmetatable({ setNewSmsCb = function(fn) app_cb = fn end },
                       { __index = real_sms })
 real_sms.setNewSmsCb(function(num, txt, metas)
   num, txt = tostring(num == nil and "" or num), tostring(txt == nil and "" or txt)
-  -- Same language as `rescue`'s own "^#(%a+)" parse: a leading space would make
-  -- rescue drop the message on the floor instead of forwarding it.
-  if app_cb and not (txt:lower():match("^#ota%s+clear%s*$") and is_owner(num, merged().OWNER)) then
-    local ok, err = pcall(app_cb, num, txt, metas)
-    if not ok then log.error("main", "sms cb", err) end
-  else pcall(rescue, num, txt) end
+  local ok, handled = pcall(sms_cmd, num, txt)
+  if not ok then log.error("main", "sms cmd", handled) end
+  if ok and handled then return end
+  if app_cb then
+    local aok, err = pcall(app_cb, num, txt, metas)
+    if not aok then log.error("main", "sms cb", err) end
+  end
 end)
 
 if not key32_of(merged()) then
-  -- No usable SMS_KEY: nothing can be encrypted, not even the registration. Say so, loudly,
-  -- and do nothing else (the SMS callback above still answers #status when OWNER is set).
+  -- No usable SMS_KEY: nothing can be encrypted, not even the registration — and no SMS
+  -- command can be verified either, so every message is simply forwarded (nowhere, since
+  -- gw.lua never starts). Say so, loudly, and do nothing else.
   _G.GCM_OK = false
   local function nag() log.error("main", "config.lua missing/invalid (SMS_KEY must be 64 hex): nothing will run") end
   nag(); sys.timerLoopStart(nag, 60000)

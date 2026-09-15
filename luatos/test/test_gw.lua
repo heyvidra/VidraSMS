@@ -131,17 +131,13 @@ eq("label with carrier", gw.sim_label("中国电信"), "SIM 1 · 中国电信")
 eq("label without carrier", gw.sim_label(nil), "SIM 1")
 eq("label separator bytes", hex(gw.sim_label("X")), hex("SIM 1") .. "20c2b720" .. hex("X"))
 
--- ---- is_owner ------------------------------------------------------------------
-print("== is_owner")
-ok("+86 vs bare", gw.is_owner("+8613800138000", "13800138000"))
-ok("bare vs +86", gw.is_owner("13800138000", "+8613800138000"))
-ok("same", gw.is_owner("13800138000", "13800138000"))
-ok("different last digit", not gw.is_owner("13800138001", "13800138000"))
-ok("empty num", not gw.is_owner("", "13800138000"))
-ok("nil owner", not gw.is_owner("13800138000", nil))
-ok("short owner exact", gw.is_owner("10086", "10086"))
-ok("short owner is not a suffix match", not gw.is_owner("13800138000", "8000"))
-ok("spaces and dashes ignored", gw.is_owner("+86 138-0013-8000", "13800138000"))
+-- ---- no owner, no phone-number gate anywhere in gw.lua --------------------------
+print("== no OWNER in gw.lua")
+-- SMS commands are main.lua's and are authenticated with SMS_KEY, not with a caller
+-- ID. gw.lua must not carry a second copy of that logic, nor read cfg.OWNER: a stale
+-- duplicate here is exactly the divergence the collapse into main.lua removed.
+ok("gw.lua exports no is_owner", gw.is_owner == nil)
+ok("gw.lua mentions OWNER nowhere", not read_file(REPO .. "/gw.lua"):find("OWNER", 1, true))
 
 -- ---- ack_detail / build_ack ------------------------------------------------------
 print("== ack_detail")
@@ -223,7 +219,7 @@ do
   fskv.clear()
   fake.http_log = {}
   gw.start({ BASES = { "https://x.test" }, TOPIC = "sms-t", NAME = "Air780EHV", POLL_MS = 30000,
-             SMS_KEY = ("00112233445566778899aabbccddeeff"):rep(2), OWNER = "+8613800138000" })
+             SMS_KEY = ("00112233445566778899aabbccddeeff"):rep(2) })
   ok("GCM_OK true (key fine)", _G.GCM_OK == true)
   ok("not started without an identity", gw._state().started == false)
   fake.tick(120000)
@@ -234,13 +230,15 @@ do
   eq("inbound SMS/call dropped, still no HTTP", #fake.http_log, 0)
   eq("nothing persisted in the queue", fskv.get("qidx"), nil)
   fake.call_end(); fake.tick(10)
-  -- #ota / #url without main.lua: reply "unavailable" to the owner only.
+  -- Standalone (no main.lua): a "#" message is just a message. gw.lua answers nothing —
+  -- the whole command channel lives in main.lua, behind the SMS_KEY signature.
   fake.sms_sent = {}
   fake.sms_incoming("+8613800138000", "#ota gw ab")
   fake.sms_incoming("+8613800138000", "#url https://h.test")
+  fake.sms_incoming("+8613800138000", "#status")
   fake.tick(10)
-  eq("#ota standalone reply", fake.sms_sent[1] and fake.sms_sent[1].body, "ota unavailable")
-  eq("#url standalone reply", fake.sms_sent[2] and fake.sms_sent[2].body, "url unavailable")
+  eq("standalone gw.lua answers no # command", #fake.sms_sent, 0)
+  eq("and still talks to nobody", #fake.http_log, 0)
   fake.sms_sent = {}
 end
 
@@ -249,7 +247,9 @@ print("== runtime (main.lua boot, mocked Worker)")
 do
   local key_hex = ("00112233445566778899aabbccddeeff"):rep(2)
   local key32 = key_hex:fromHex()
-  local OWNER = "+8613800138000"
+  local PHONE = "+8613800138000"       -- any phone: the signature authenticates, not the number
+  -- The SMS wire format main.lua verifies: "<body> <first 16 hex of HMAC(\"sms\\n\"+body)>".
+  local function signed(body) return body .. " " .. crypto.hmac_sha256("sms\n" .. body, key32):sub(1, 16):lower() end
   local requests = {}
   local status, rows, cmd, upload_code, poll_code = "pending", "[]", "null", 200, 200
   local ota_files = {}
@@ -280,7 +280,7 @@ do
 
   fskv.clear()
   fake.no_run = true
-  fake.config = { BASES = { "https://x.test" }, TOPIC = "sms-t", SMS_KEY = key_hex, OWNER = OWNER, NAME = "Air780EHV", POLL_MS = 30000 }
+  fake.config = { BASES = { "https://x.test" }, TOPIC = "sms-t", SMS_KEY = key_hex, NAME = "Air780EHV", POLL_MS = 30000 }
   fake.reboot_cycle()
   local rt = require("gw")   -- the instance main.lua started
   local st = rt._state()
@@ -313,7 +313,7 @@ do
   eq("pending: message queued", #rt._state().queue, 1)
   eq("pending: nothing uploaded", #find("/sms-t"), 0)
   eq("pending: no devinfo any more", #find("/api/devinfo"), 0)
-  eq("#status while pending", (function() fake.sms_sent = {}; fake.sms_incoming(OWNER, "#status"); fake.tick(10); return fake.sms_sent[1] and fake.sms_sent[1].body end)(),
+  eq("signed #status while pending", (function() fake.sms_sent = {}; fake.sms_incoming(PHONE, signed("#status")); fake.tick(10); return fake.sms_sent[1] and fake.sms_sent[1].body end)(),
     "2.0.0 csq=20 net=1 ip=10.0.0.2 q=1 gcm=ok fw=V2050 trust=pending ota=- boot=1")
 
   -- Trusted on the web: the next poll sees it → queue drains → re-register on the following cycle.
@@ -348,19 +348,25 @@ do
   fake.tick(10)
   eq("ringing cleared", rt._state().ringing, false)
 
-  -- Owner control message is not forwarded; #status replies by SMS.
+  -- A signed command is executed and NOT forwarded; the rich line comes from gw.lua
+  -- through _G.gw_status_line, which is the only thing gw.lua still contributes here.
   requests = {}
   fake.sms_sent = {}
-  fake.sms_incoming(OWNER, "#status")
+  fake.sms_incoming(PHONE, signed("#status"))
   fake.tick(10)
-  eq("control not uploaded", #find("/sms-t"), 0)
+  eq("signed command not uploaded", #find("/sms-t"), 0)
   eq("status reply sent", #fake.sms_sent, 1)
   eq("status reply exact", fake.sms_sent[1].body, "2.0.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=1")
-  -- Non-owner "#status" is forwarded like any SMS.
+  ok("the rich line is gw.lua's hook", type(_G.gw_status_line) == "function")
+  eq("the hook is what answered", _G.gw_status_line(), fake.sms_sent[1].body)
+  -- An UNSIGNED "#status" — from any number at all — is an ordinary message: gw.lua
+  -- forwards it, so the probe shows up on the web page instead of being answered.
   requests = {}
+  fake.sms_sent = {}
+  fake.sms_incoming(PHONE, "#status")
   fake.sms_incoming("+8613800138001", "#status")
   fake.tick(10)
-  eq("non-owner #status uploaded", #find("/sms-t"), 1)
+  eq("unsigned #status forwarded by gw.lua, never answered", #find("/sms-t") .. " " .. #fake.sms_sent, "2 0")
 
   -- Blocked: poll says so → uploads pause, queue keeps the message; trusted again → drains.
   status = "blocked"
@@ -607,7 +613,7 @@ do
   fake.tick(10)
   eq("OTA gw runs after the reboot", _G.GW_TAG, "ota")
   eq("register now reports ota=gw", gcm.open(key32, find("/api/register")[1].body):match('"ota":"gw"') ~= nil, true)
-  eq("#status shows ota=gw", (function() fake.sms_sent = {}; fake.sms_incoming(OWNER, "#status"); fake.tick(10); return fake.sms_sent[1] and fake.sms_sent[1].body end)(),
+  eq("signed #status shows ota=gw", (function() fake.sms_sent = {}; fake.sms_incoming(PHONE, signed("#status")); fake.tick(10); return fake.sms_sent[1] and fake.sms_sent[1].body end)(),
     "2.0.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=gw boot=1")
   _G.GW_TAG = nil
 
@@ -641,77 +647,29 @@ do
   next_poll()
   eq("a 500 is an ordinary failure: no forced re-register", #find("/api/register"), 0)
 
-  -- ---- OWNER SMS commands ----------------------------------------------------------
-  print("== OWNER SMS commands")
-  -- #ota clear is always main.lua's: copies removed, reboot in 10 s.
-  fake.sms_sent = {}
-  fake.sms_incoming(OWNER, "#ota clear")
-  fake.tick(10)
-  eq("#ota clear reply", fake.sms_sent[1] and fake.sms_sent[1].body, "ota cleared rebooting")
-  eq("#ota clear removed the copy", _G.gw_ota.active(), "-")
-  fake.tick(10000)
-  ok("#ota clear rebooted", fake.rebooted)
-  fake.reboot_cycle(); rt = require("gw")
-  fake.tick(10)
-  -- #ota gw <hmac>: same download from the Worker, replied by SMS.
-  fake.sms_sent = {}
-  fake.sms_incoming(OWNER, "#ota gw " .. mac("gw", mod))
-  fake.tick(100)
-  eq("#ota by SMS installs", fake.sms_sent[1] and fake.sms_sent[1].body, "ota ok gw " .. #mod .. " rebooting")
-  eq("#ota by SMS wrote the file", read_file(fake.fs_root .. "/ota_gw.lua"), mod)
-  fake.tick(10000)
-  ok("#ota by SMS rebooted", fake.rebooted)
+  -- ---- gw.lua no longer handles "#" at all ------------------------------------------
+  print("== gw.lua forwards # messages")
+  -- Everything the old control() did now lives in main.lua behind the SMS_KEY signature
+  -- (test_main.lua covers the whole command matrix). What has to be true HERE is that
+  -- gw.lua treats an unsigned "#" like any other SMS — even with a stale cfg.OWNER left
+  -- in someone's config.lua — and that a signed one never reaches it at all.
   fake.fs_clear()
-  fake.reboot_cycle(); rt = require("gw")
-  fake.tick(10)
-  fake.sms_sent = {}
-  fake.sms_incoming(OWNER, "#ota gw " .. mac("gcm", mod))
-  fake.tick(100)
-  eq("#ota by SMS with the wrong slot → hmac", fake.sms_sent[1] and fake.sms_sent[1].body, "ota fail: hmac")
-  fake.sms_incoming(OWNER, "#ota gw")
-  fake.tick(10)
-  ok("#ota usage", (fake.sms_sent[2] and fake.sms_sent[2].body or ""):match("^usage: #ota ") ~= nil)
-  -- #url: validated and stored by main.lua's `bases` command; #url reset drops the override.
-  fake.sms_sent = {}
-  fake.sms_incoming(OWNER, "#url http://plain.test")
-  fake.tick(10)
-  eq("#url http refused", fake.sms_sent[1] and fake.sms_sent[1].body, "url fail: bad bases")
-  eq("#url refused stored nothing", fskv.get("bases"), nil)
-  -- Deliberately UNSIGNED: this path is already gated on the owner's number from config.lua and
-  -- is the documented way back when the web is unreachable and nothing can sign. It goes through
-  -- _G.gw_cmd.url, never _G.gw_cmd.run, so the network can never reach an unsigned `bases`.
-  fake.sms_incoming(OWNER, "#url https://c.test,https://d.test")
-  fake.tick(10)
-  eq("#url reply", fake.sms_sent[2] and fake.sms_sent[2].body, "url ok rebooting")
-  eq("#url stored (no signature needed on the OWNER SMS path)", fskv.get("bases"), "https://c.test,https://d.test")
-  fake.tick(5000)
-  ok("#url rebooted", fake.rebooted)
-  fake.reboot_cycle(); rt = require("gw")
-  fake.tick(10)
-  fake.sms_incoming(OWNER, "#url reset")
-  fake.tick(10)
-  eq("#url reset cleared the override", fskv.get("bases"), nil)
-  ok("#url reset rebooted", fake.rebooted)
-  -- #reboot from the owner clears main.lua's failed-boot counter before rebooting.
-  fake.reboot_cycle(); rt = require("gw")
-  fake.tick(10)
-  fskv.set("boot_fail", 2)
-  fake.sms_incoming(OWNER, "#reboot")
-  fake.tick(10)
-  ok("#reboot rebooted", fake.rebooted)
-  eq("#reboot reset boot_fail", fskv.get("boot_fail"), 0)
-  -- Without OWNER, "#…" from anyone (the ex-owner included) is an ordinary message.
-  fake.config.OWNER = nil
+  fake.config.OWNER = PHONE
   fake.reboot_cycle(); rt = require("gw")
   fake.tick(10)
   requests = {}
   fake.sms_sent = {}
-  fake.sms_incoming(OWNER, "#status")
-  fake.sms_incoming(OWNER, "#reboot")
+  fake.sms_incoming(PHONE, "#status")
+  fake.sms_incoming(PHONE, "#reboot")
   fake.tick(100)
-  eq("no OWNER: #status forwarded, not answered", #find("/sms-t") .. " " .. #fake.sms_sent, "2 0")
-  ok("no OWNER: #reboot did not reboot", not fake.rebooted)
-  fake.config.OWNER = OWNER
+  eq("a stale cfg.OWNER changes nothing: both forwarded, neither answered", #find("/sms-t") .. " " .. #fake.sms_sent, "2 0")
+  ok("an unsigned #reboot does not reboot", not fake.rebooted)
+  fake.config.OWNER = nil
+  requests = {}
+  fake.sms_sent = {}
+  fake.sms_incoming(PHONE, signed("#status"))
+  fake.tick(100)
+  eq("its signed twin is answered by main.lua and not forwarded", #find("/sms-t") .. " " .. #fake.sms_sent, "0 1")
   fake.http_mock = nil
 end
 
@@ -720,7 +678,7 @@ end
 -- extra starts stay dormant (no tick follows) and only GCM_OK is observed.
 print("== bad SMS_KEY disables uploads")
 do
-  local base = { BASES = { "https://x.test" }, TOPIC = "sms-t", OWNER = "+8613800138000", POLL_MS = 30000 }
+  local base = { BASES = { "https://x.test" }, TOPIC = "sms-t", POLL_MS = 30000 }
   base.SMS_KEY = "not-64-hex-at-all"
   gw.start(base)
   ok("GCM_OK false on non-hex key", _G.GCM_OK == false)

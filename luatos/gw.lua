@@ -15,8 +15,10 @@
 -- LuatOS globals used: sys, http, sms, fskv, mobile, crypto, log, rtos, json,
 -- socket; optional (guarded): cc. `.wait()` calls only ever run inside
 -- sys.taskInit tasks; timer callbacks never yield. From main.lua: _G.gw_reg
--- (the registration JSON), _G.gw_cmd.run (web commands), _G.gw_ota (#ota by
--- SMS), _G.gw_alive (boot health) — guarded, so the helpers load standalone.
+-- (the registration JSON), _G.gw_cmd.run (web commands), _G.gw_ota.active (OTA
+-- state), _G.gw_alive (boot health) — guarded, so the helpers load standalone.
+-- To main.lua: _G.gw_status_line, the rich line a signed "#status" SMS answers
+-- with. SMS commands themselves are main.lua's: they must survive a broken gw.lua.
 
 local M = {}
 
@@ -135,19 +137,6 @@ end
 function M.sim_label(carrier)
   if blank(carrier) then return "SIM 1" end
   return "SIM 1 · " .. carrier
-end
-
-local function digits(s) return (tostring(s == nil and "" or s):gsub("%D", "")) end
-
--- Owner check for the optional SMS commands: compare the last 11 digits so
--- "+86138…" and "138…" agree. Shorter owners must match exactly.
--- ponytail: sender-number match only — a spoofed OWNER can run #url/#reboot.
--- Upgrade path: gate control on a rotating one-time password (shared secret in
--- fskv) or a fixed device allowlist here before acting on the command.
-function M.is_owner(num, owner)
-  local a, b = digits(num), digits(owner)
-  if a == "" or b == "" then return false end
-  return a:sub(-11) == b:sub(-11)
 end
 
 -- Ack detail (SmsSender.kt ackOutbox): success → the attempt id; failure →
@@ -658,8 +647,11 @@ local function poller()
   end
 end
 
--- --- inbound SMS + optional OWNER commands -----------------------------------
+-- --- inbound SMS -------------------------------------------------------------
 
+-- The #status line, published to main.lua as _G.gw_status_line (M.start). main.lua
+-- owns SMS command handling — it has to work with gw.lua broken or absent — but it
+-- cannot see any of this: the queue depth, the trust state, the signal. So it asks.
 local function status_line()
   local function safe(f, ...) local ok, v = pcall(f, ...); if ok and v ~= nil then return tostring(v) end return "-" end
   local ip = "-"
@@ -672,71 +664,13 @@ local function status_line()
     _G.GCM_OK and "ok" or "FAIL", safe(rtos.version), trust, ota, tonumber(kv_get("boot_fail")) or 0)
 end
 
--- nil = busy (a poller send is in flight); one retry after the 45 s report window.
-local function reply(num, text)
-  if not sms.send(num, text) then
-    sys.timerStart(function() sms.send(num, text) end, SEND_WAIT + 5000)
-  end
-end
-
--- A reboot the owner asked for is not a failed boot: clear main.lua's counter
--- first, or three quick #url/#reboot in a row would land in rescue mode.
-local function reboot_now()
-  kv_set("boot_fail", 0)
-  rtos.reboot()
-end
-
-local function control(num, txt)
-  local cmd, rest = txt:match("^#(%a+)%s*(.-)%s*$")
-  cmd = cmd and cmd:lower() or ""
-  log.info("gw", "control", cmd, rest)
-  if cmd == "reboot" then
-    reboot_now()
-  elseif cmd == "status" then
-    reply(num, status_line())
-  elseif cmd == "url" then
-    -- "#url reset" drops the fskv override; "#url https://a,https://b" is the
-    -- web `bases` command by SMS (validated and stored by main.lua, reboot in 5 s).
-    -- It goes through _G.gw_cmd.url, which does NOT require the SMS_KEY signature a
-    -- poll-delivered `bases` does: this path is already gated on the owner's number, and
-    -- it is the documented recovery when the web is unreachable and nothing can sign.
-    if rest:lower() == "reset" then
-      -- main.lua owns the override state (bases + bases_ok + bases_try): let it clear all three.
-      -- Fall back to deleting just "bases" only if that layer is somehow absent.
-      if _G.gw_cmd and _G.gw_cmd.url_reset then _G.gw_cmd.url_reset() else kv_del("bases") end
-      reboot_now()
-    elseif _G.gw_cmd and _G.gw_cmd.url then
-      local ok, d = _G.gw_cmd.url(rest)
-      reply(num, ok and "url ok rebooting" or ("url fail: " .. d))
-    else
-      reply(num, "url unavailable")
-    end
-  elseif cmd == "ota" then
-    -- "#ota clear" | "#ota <gw|gcm> <hmac-sha256 hex>": main.lua downloads the
-    -- script staged on the Worker, verifies and installs; gw.lua only parses.
-    if not _G.gw_ota then
-      reply(num, "ota unavailable")
-    elseif rest:lower() == "clear" then
-      _G.gw_ota.clear(num)
-    else
-      local name, mac = rest:match("^(%S+)%s+(%S+)$")
-      if name then _G.gw_ota.install(name, mac, serving or bases[1], num)
-      else reply(num, "usage: #ota clear | #ota gw|gcm <hmac-sha256 hex>") end
-    end
-  else
-    log.warn("gw", "unknown control command", cmd)
-  end
-end
-
+-- Every message that reaches gw.lua is an ordinary message: main.lua's callback has
+-- already taken (and NOT forwarded) anything that carried a valid signature, so a "#…"
+-- arriving here is a probe or a typo and the user should see it on the web page.
 local function on_sms(num, txt, metas)
   num = tostring(num == nil and "" or num)
   txt = tostring(txt == nil and "" or txt)
   if num == "" then num = "未知" end
-  -- Only an OWNER set in config.lua enables the # commands; without one every
-  -- SMS, "#…" included, is an ordinary message and gets forwarded.
-  if txt:sub(1, 1) == "#" and not blank(cfg.OWNER) and M.is_owner(num, cfg.OWNER) then
-    return control(num, txt)          -- control messages are not forwarded
-  end
   enqueue(num, txt, os.time())
 end
 
@@ -839,6 +773,11 @@ function M.start(c)
   ring = type(d) == "string" and d or ""
   load_queue()
 
+  -- Hand main.lua the rich #status line. Set here, before the early return below, so a
+  -- dormant gw.lua (no key/identity/base) still answers with what it knows rather than
+  -- main.lua's bare RESCUE line.
+  _G.gw_status_line = status_line
+
   sms.setNewSmsCb(function(num, txt, metas)
     perr("sms cb", pcall(on_sms, num, txt, metas))
   end)
@@ -847,7 +786,7 @@ function M.start(c)
   end)
 
   -- Without a key, an identity or a base there is nothing to talk to the Worker
-  -- with: keep the callbacks (so #status works when OWNER is set), start no task.
+  -- with: keep the callbacks (so a signed #status still answers), start no task.
   if not (key_ok and ident_ok and #bases > 0) then
     log.error("gw", "network tasks not started (key/identity/bases)")
     return M

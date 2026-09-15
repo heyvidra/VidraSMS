@@ -1,16 +1,20 @@
 -- test_main.lua — boots the REAL main.lua under test/fake_luatos.lua (config.lua
 -- served from fake.config, the Worker mocked) and walks the "flash once, never
 -- again" life cycle:
---   0. no config.lua / bad SMS_KEY: nothing starts, logs every 60 s, #status if OWNER
+--   0. no config.lua / bad SMS_KEY: nothing starts, logs every 60 s, no command validates
 --   1. config.lua: identity minted, register at boot, trust gating, health rule
+--  1b. the SMS signature gate: only a valid 16-hex mac over "sms\n<body>" executes;
+--      everything else is forwarded, unanswered — incl. the luatos/sms-sign.sh round trip
 --   2. web reboot cmd: ack before reboot, last_cmd dedupe across a reboot_cycle
 --   3. web ota cmd: install, wdt armed before the chunk, broken copies removed at boot
+--  3b. the same commands over signed SMS in normal mode (#reboot/#url/#ota)
+--  3c. "#ota" walks every configured base — the break-glass case one of them is dead
 --   4. OTA gw that crashes in start → reverted after 3 failed boots
 --   5. liveness: OTA gw that polls nothing → reverted after 3 cycles; flashed gw
 --      offline for an hour → never rebooted and never walked into rescue mode;
 --      an OTA gw that can never reach the Worker still reverted
 --   6. flashed gw that crashes → rescue mode: registers, polls, runs an ota cmd
---      from the mock and recovers; retry timing; OWNER SMS in rescue; fskv.get raising
+--      from the mock and recovers; retry timing; signed SMS in rescue; fskv.get raising
 --   7. degraded hardware: TRNG that fails, fskv that cannot persist the identity,
 --      a boot counter that can be neither written nor erased
 -- Run: lua luatos/test/test_main.lua
@@ -48,19 +52,25 @@ local function log_has(s) for _, l in ipairs(fake.log_lines) do if l:find(s, 1, 
 local function log_count(s) local n = 0; for _, l in ipairs(fake.log_lines) do if l:find(s, 1, true) then n = n + 1 end end; return n end
 
 -- ---- fixtures ------------------------------------------------------------------
-local OWNER, STRANGER = "+8613800138000", "+8613900000000"
+-- No number is trusted: the SMS signature is the whole credential, so PHONE and OTHER
+-- are interchangeable and only the mac decides.
+local PHONE, OTHER = "+8613800138000", "+8613900000000"
 local KEY1 = ("00112233445566778899aabbccddeeff"):rep(2)
 local key1raw = KEY1:fromHex()
+-- The wire format main.lua verifies: "<body> <first 16 hex of HMAC-SHA256("sms\n"+body)>".
+local function sms_mac(body) return (crypto.hmac_sha256("sms\n" .. body, key1raw):sub(1, 16):lower()) end
+local function signed(body) return body .. " " .. sms_mac(body) end
 local UPLOAD_PATH = "/sms-7f3a9c2b1e0d?dev="        -- baked-in default TOPIC
 local BASE = "https://777310753.xyz"                 -- first baked-in default base
 local function ota_mac(name, body) return crypto.hmac_sha256(name .. "\n" .. body, key1raw) end
-local CONFIG = { SMS_KEY = KEY1, OWNER = OWNER }     -- everything else = main.lua DEFAULTS
+local CONFIG = { SMS_KEY = KEY1 }                    -- everything else = main.lua DEFAULTS
 
 -- The mocked Worker: register/poll answer `status`; a trusted poll carries `rows` + `cmd`;
 -- /api/ota/get serves `ota_files`; `offline` makes every request fail like no network.
 local requests, ota_files = {}, {}
 local status, rows, cmd, upload_code, offline = "trusted", "[]", "null", 200, false
 local dead_hosts = {}
+local ota_get_code = {}   -- host → status code: a base that IS reachable but answers badly
 local polls_seen, cmd_id = 0, 100
 fake.http_mock = function(method, url, headers, body)
   requests[#requests + 1] = { method = method, url = url, headers = headers, body = body }
@@ -75,6 +85,7 @@ fake.http_mock = function(method, url, headers, body)
   end
   if url:find("/api/outbox/ack", 1, true) or url:find("/api/cmd/ack", 1, true) then return 200, {}, '{"ok":true}' end
   if url:find("/api/ota/get?", 1, true) then
+    for h, c in pairs(ota_get_code) do if url:find(h, 1, true) then return c, {}, "" end end
     local f = ota_files[url:match("name=(%a+)")]
     if f then return 200, {}, f end
     return 404, {}, "not found"
@@ -125,25 +136,27 @@ ok("missing config logged", log_has("config.lua missing/invalid"))
 fake.tick(180000)
 eq("no HTTP after 3 min", #requests, 0)
 ok("nagged again every 60 s", log_count("config.lua missing/invalid") >= 4)
-fake.sms_incoming(OWNER, "#status")
+fake.sms_incoming(PHONE, signed("#status"))
 fake.sms_incoming("10086", "dropped: nothing to encrypt with")
 fake.call_incoming("+8613700000000")
 fake.tick(100)
-eq("no OWNER: #status not answered", #fake.sms_sent, 0)
+eq("no key: not even a correctly signed #status is answered", #fake.sms_sent, 0)
 eq("SMS/call dropped, no HTTP", #requests, 0)
 fake.call_end(); fake.tick(10)
 fake.tick(20 * 60000)
 ok("never alive, no OTA: main.lua never reboots", not fake.rebooted)
 eq("boot_fail untouched (never alive)", fskv.get("boot_fail"), 1)
-fake.config = { SMS_KEY = "not-a-key", OWNER = OWNER }
+fake.config = { SMS_KEY = "not-a-key" }
 boot()
 ok("bad key logged as invalid config", log_has("config.lua missing/invalid"))
 fake.tick(60000)
 eq("bad key: no HTTP", #requests, 0)
-ok("bad key + OWNER: main.lua answers #status",
-  (sms_reply(OWNER, "#status") or ""):match("^RESCUE boot_fail=2 ota=%- fw=V2050 ver=2%.0%.0 dev=[0-9a-f]+$") ~= nil)
-eq("stranger #status ignored", sms_reply(STRANGER, "#status"), nil)
-fake.config = { SMS_KEY = ("0"):rep(64), OWNER = OWNER }
+-- A key that cannot be parsed cannot verify anything, so every "#" is an ordinary
+-- message: no reply (no oracle, no SMS spend) and nothing runs.
+eq("bad key: a signed #status is not answered", sms_reply(PHONE, signed("#status")), nil)
+eq("bad key: an unsigned #status is not answered either", sms_reply(PHONE, "#status"), nil)
+ok("bad key: nothing rebooted", not fake.rebooted)
+fake.config = { SMS_KEY = ("0"):rep(64) }
 boot()
 fake.tick(60000)
 eq("all-zero key: no HTTP", #requests, 0)
@@ -178,7 +191,7 @@ requests = {}
 fake.sms_incoming("10086", "您的验证码 1234")
 fake.tick(20000)
 eq("pending: queued, not uploaded", #require("gw")._state().queue .. " " .. #find(UPLOAD_PATH), "1 0")
-eq("#status while pending", sms_reply(OWNER, "#status"), "2.0.0 csq=20 net=1 ip=10.0.0.2 q=1 gcm=ok fw=V2050 trust=pending ota=- boot=1")
+eq("signed #status while pending", sms_reply(PHONE, signed("#status")), "2.0.0 csq=20 net=1 ip=10.0.0.2 q=1 gcm=ok fw=V2050 trust=pending ota=- boot=1")
 status = "trusted"
 next_poll(); fake.tick(100)
 eq("trusted: upload", #find(UPLOAD_PATH), 1)
@@ -189,20 +202,77 @@ eq("boot_fail still 1 before 5 min", fskv.get("boot_fail"), 1)
 fake.tick(300000)
 eq("boot_fail 0 after 5 min alive", fskv.get("boot_fail"), 0)
 ok("not rebooted", not fake.rebooted)
--- Stranger "#" commands are ordinary messages; the owner's are not forwarded.
+-- An unsigned "#" is an ordinary message, whoever sent it.
 requests = {}
-eq("stranger #reboot gets no reply", sms_reply(STRANGER, "#reboot"), nil)
+eq("unsigned #reboot gets no reply", sms_reply(OTHER, "#reboot"), nil)
 fake.tick(100)
-eq("stranger #reboot forwarded as a normal SMS", #find(UPLOAD_PATH), 1)
-ok("stranger #reboot did not reboot", not fake.rebooted)
-eq("#status line", sms_reply(OWNER, "#status"), "2.0.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=0")
--- Neither parser accepts a leading space, so " #ota clear" is an ordinary message:
--- it must be forwarded, never quietly swallowed by main.lua's interception.
+eq("unsigned #reboot forwarded as a normal SMS", #find(UPLOAD_PATH), 1)
+ok("unsigned #reboot did not reboot", not fake.rebooted)
+eq("signed #status line", sms_reply(PHONE, signed("#status")), "2.0.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=0")
+-- An unsigned " #ota clear" is forwarded VERBATIM (leading space and all), never quietly
+-- swallowed: the user has to be able to see a probe on the web page.
 requests = {}
-eq("leading-space #ota clear: no reply", sms_reply(OWNER, " #ota clear"), nil)
+eq("unsigned ' #ota clear': no reply", sms_reply(PHONE, " #ota clear"), nil)
 fake.tick(20000)
-eq("leading-space #ota clear is forwarded like any other SMS", #find(UPLOAD_PATH), 1)
-eq("leading-space #ota clear decrypts as the original text", gcm.open(key1raw, find(UPLOAD_PATH)[1].body), inbound(OWNER, " #ota clear"))
+eq("unsigned ' #ota clear' is forwarded like any other SMS", #find(UPLOAD_PATH), 1)
+eq("unsigned ' #ota clear' decrypts as the original text", gcm.open(key1raw, find(UPLOAD_PATH)[1].body), inbound(PHONE, " #ota clear"))
+
+-- =============================================================================
+print("== 1b. the signature gate: only a valid mac executes, everything else is forwarded")
+-- There is no phone number to trust — a caller ID is trivially spoofable — so the MAC
+-- over "sms\n<body>" under SMS_KEY is the whole credential. A message that does not
+-- verify is forwarded like any other SMS and NEVER answered: no oracle, no SMS spend,
+-- and the probe shows up on the web page where the user can see it.
+local LINE0 = "2.0.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=0"
+requests = {}
+eq("a valid mac executes", sms_reply(PHONE, signed("#status")), LINE0)
+fake.tick(20000)
+eq("a signed command is never forwarded", #find(UPLOAD_PATH), 0)
+eq("any sender may sign: the number is not the credential", sms_reply(OTHER, signed("#status")), LINE0)
+local BAD_MACS = {
+  { "no mac",                  "#status" },
+  { "wrong mac",               "#status " .. ("0"):rep(16) },
+  { "mac of a different body", "#status " .. sms_mac("#reboot") },
+  { "15-hex mac",              "#status " .. sms_mac("#status"):sub(1, 15) },
+  { "17-hex mac",              "#status " .. sms_mac("#status") .. "0" },
+  { "full 64-hex mac",         "#status " .. crypto.hmac_sha256("sms\n#status", key1raw) },
+  { "non-hex mac",             "#status " .. ("z"):rep(16) },
+}
+for _, case in ipairs(BAD_MACS) do
+  local name, text = case[1], case[2]
+  requests = {}
+  eq(name .. ": no reply", sms_reply(PHONE, text), nil)
+  fake.tick(20000)
+  eq(name .. ": forwarded verbatim", gcm.open(key1raw, (find(UPLOAD_PATH)[1] or {}).body or ""), inbound(PHONE, text))
+end
+-- The leading "#" is a gate of its own, not a shorthand for "parses as a command": only a
+-- "#" message can ever be one. A correctly signed body WITHOUT it is an ordinary SMS and
+-- must travel on to the web page like any other — never swallowed as an unparsable command.
+requests = {}
+eq("a signed non-# body is not a command: no reply", sms_reply(PHONE, signed("status")), nil)
+fake.tick(20000)
+eq("a signed non-# body is forwarded verbatim",
+  gcm.open(key1raw, (find(UPLOAD_PATH)[1] or {}).body or ""), inbound(PHONE, signed("status")))
+ok("none of them ran: no reboot, no bases", not fake.rebooted and fskv.get("bases") == nil)
+-- The same value, typed in caps: accepted (people retype these by hand).
+eq("an uppercase mac is the same value", sms_reply(PHONE, "#status " .. sms_mac("#status"):upper()), LINE0)
+-- One canonical form: trim the whole message, split the LAST whitespace-separated token
+-- off as the mac, trim the remainder. Both ends implement exactly that.
+eq("surrounding whitespace is trimmed before verifying", sms_reply(PHONE, "  " .. signed("#status") .. "\t"), LINE0)
+eq("the gap before the mac is not part of the body", sms_reply(PHONE, "#status   " .. sms_mac("#status")), LINE0)
+do -- luatos/sms-sign.sh and the device must agree byte-for-byte, incl. "://", "," "." and a space
+  local keyf = os.tmpname(); write_file(keyf, KEY1 .. "\n")
+  local body = "#url https://a.example.com,https://b.example.com"
+  local line = run("SMS_KEY_FILE='" .. keyf .. "' bash '" .. REPO .. "/sms-sign.sh' '" .. body .. "' 2>/dev/null")
+  os.remove(keyf)
+  eq("sms-sign.sh prints '<body> <16 hex>'", line, signed(body) .. "\n")
+  eq("the device accepts the signer's line verbatim", sms_reply(PHONE, (line:gsub("%s+$", ""))), "url ok rebooting")
+  eq("and applied exactly the signed value", fskv.get("bases"), "https://a.example.com,https://b.example.com")
+  fake.tick(5000)
+  ok("the signer's #url rebooted", fake.rebooted)
+end
+fskv.del("bases"); fskv.del("bases_ok"); fskv.del("bases_try")
+boot(); fake.tick(10); next_poll()
 
 -- =============================================================================
 print("== 2. web reboot cmd: ack before reboot, dedupe across a reboot")
@@ -333,7 +403,7 @@ eq("gw.lua did not arm a second watchdog", _G.WDT_INIT_CALLS, 1)
 wdt.init = real_wdt_init
 ok("OTA gw registers + polls", #find("/api/register") == 1 and polls() >= 1)
 eq("register reports ota=gw, boot=1", gcm.open(key1raw, find("/api/register")[1].body), reg_json("SIM 1 · 中国电信", "", "gw", 1))
-eq("#status shows ota=gw", sms_reply(OWNER, "#status"), "2.0.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=gw boot=1")
+eq("signed #status shows ota=gw", sms_reply(PHONE, signed("#status")), "2.0.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=gw boot=1")
 -- Broken copies (power loss mid-write) are removed at boot instead of lingering
 -- behind a misleading ota=gw. (5 min of answered polls between boots, so the
 -- boot-loop guard stays out of the picture.)
@@ -345,14 +415,117 @@ ok("truncated copy: removal logged", log_has("ota gw unusable, removed"))
 eq("truncated copy removed", ota_file("gw"), nil)
 eq("flashed gw runs", _G.GW_TAG, nil)
 ok("flashed gw polls", polls() >= 1)
-eq("#status no longer claims ota=gw", sms_reply(OWNER, "#status"), "2.0.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=1")
+eq("signed #status no longer claims ota=gw", sms_reply(PHONE, signed("#status")), "2.0.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=1")
 fake.tick(310000)
 write_file(fake.fs_root .. "/ota_gcm.lua", "local x = 1\n")   -- compiles, returns nothing
 boot()
 fake.tick(10)
 ok("copy returning no module: removal logged", log_has("ota gcm unusable, removed"))
 eq("it is removed", ota_file("gcm"), nil)
-eq("flashed gcm in use", sms_reply(OWNER, "#status"), "2.0.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=1")
+eq("flashed gcm in use", sms_reply(PHONE, signed("#status")), "2.0.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=1")
+
+-- =============================================================================
+print("== 3b. the same commands over signed SMS, in normal mode")
+-- Everything the web buttons do, the break-glass channel does too — it is the only way
+-- in when the Worker or the domain cannot be reached at all. Same execution paths, a
+-- different gate. (Section 6 runs the same list in rescue mode, with gw.lua dead.)
+fskv.set("boot_fail", 2)
+fake.sms_sent = {}
+fake.sms_incoming(PHONE, signed("#reboot")); fake.tick(100)
+ok("signed #reboot rebooted", fake.rebooted)
+eq("signed #reboot is deliberate: counter cleared", fskv.get("boot_fail"), 0)
+eq("signed #reboot answers nothing (it is already gone)", #fake.sms_sent, 0)
+boot(); fake.tick(10)
+-- "#url" needs no second signature over the value: the whole message is already signed
+-- under the same SMS_KEY, unlike a `bases` that arrived over the network.
+eq("signed #url stores the bases", sms_reply(PHONE, signed("#url https://c.test,https://d.test")), "url ok rebooting")
+eq("signed #url stored", fskv.get("bases"), "https://c.test,https://d.test")
+eq("signed #url http:// refused", sms_reply(PHONE, signed("#url http://plain.test")), "url fail: bad bases")
+eq("the refused one changed nothing", fskv.get("bases"), "https://c.test,https://d.test")
+fake.tick(5000)
+boot(); fake.tick(10)                                  -- comes up on the (unreachable) override
+fake.sms_incoming(PHONE, signed("#url reset")); fake.tick(100)
+eq("signed #url reset dropped the override", fskv.get("bases"), nil)
+eq("signed #url reset dropped the markers too", tostring(fskv.get("bases_ok")) .. " " .. tostring(fskv.get("bases_try")), "nil nil")
+ok("signed #url reset rebooted", fake.rebooted)
+boot(); fake.tick(10)
+ok("back on a built-in domain", (last("/api/poll?") or {}).url:find(BASE, 1, true) ~= nil)
+-- "#ota gw <hmac>": the same download from the Worker and the same install as the web
+-- button — the file HMAC is part of the signed body, so both signatures are checked.
+ota_files.gw = mod
+eq("signed #ota with a wrong slot hmac is refused", sms_reply(PHONE, signed("#ota gw " .. ota_mac("gcm", mod))), "ota fail: hmac")
+eq("refused #ota wrote no file", ota_file("gw"), nil)
+ok("signed #ota without the hmac replies usage", (sms_reply(PHONE, signed("#ota gw")) or ""):match("^usage: #ota ") ~= nil)
+eq("signed #ota gw installs", sms_reply(PHONE, signed("#ota gw " .. mac)), "ota ok gw " .. #mod .. " rebooting")
+eq("signed #ota gw wrote the file", ota_file("gw"), mod)
+eq("signed #ota download url", last("/api/ota/get").url, BASE .. "/api/ota/get?dev=" .. dev() .. "&name=gw")
+fake.tick(10000)
+boot(); fake.tick(10)
+eq("the OTA copy is what runs", _G.GW_TAG, "ota")
+eq("signed #ota clear reply", sms_reply(PHONE, signed("#ota clear")), "ota cleared rebooting")
+eq("signed #ota clear removed the copy", _G.gw_ota.active(), "-")
+fake.tick(10000)
+boot(); fake.tick(10)
+eq("back on the flashed gw", _G.GW_TAG, nil)
+fake.tick(310000)                                      -- healthy boot: counter back to 0
+
+-- =============================================================================
+print("== 3c. #ota walks every configured base (the break-glass case: one is unreachable)")
+-- This is the whole reason the SMS channel exists: a base that cannot be reached. So
+-- "#ota" tries each configured base in turn — but ONLY a download failure ("http …") is
+-- worth another one. A base that actually served the bytes has answered the question:
+-- a wrong file hmac or a script that will not compile fails identically everywhere, and
+-- walking on would just re-download the same rejection from every domain in the list.
+local BASE2 = "https://20150411.xyz"                   -- the second baked-in default
+ota_files.gw = mod
+do   -- 1) first base unreachable (no network at all), second serves
+  dead_hosts["777310753.xyz"] = true
+  requests = {}
+  eq("#ota walks past a base that cannot be reached",
+    sms_reply(PHONE, signed("#ota gw " .. mac)), "ota ok gw " .. #mod .. " rebooting")
+  local gets = find("/api/ota/get?")
+  eq("both bases were asked", #gets, 2)
+  ok("the dead one first", gets[1] ~= nil and gets[1].url:find(BASE, 1, true) ~= nil)
+  ok("the live one second", gets[2] ~= nil and gets[2].url:find(BASE2, 1, true) ~= nil)
+  eq("the fallback install is byte-exact", ota_file("gw"), mod)
+  dead_hosts["777310753.xyz"] = nil
+  fake.tick(10000); boot(); fake.tick(10)
+  eq("the copy fetched from the second base is what runs", _G.GW_TAG, "ota")
+  eq("cleared again", sms_reply(PHONE, signed("#ota clear")), "ota cleared rebooting")
+  fake.tick(10000); boot(); fake.tick(10)
+end
+do   -- 2) first base reachable but answering 500: still "http …", so walk on
+  ota_get_code["777310753.xyz"] = 500
+  requests = {}
+  eq("#ota walks past a base that answers 500",
+    sms_reply(PHONE, signed("#ota gw " .. mac)), "ota ok gw " .. #mod .. " rebooting")
+  eq("both bases were asked (500 then 200)", #find("/api/ota/get?"), 2)
+  eq("the 500 fallback install is byte-exact", ota_file("gw"), mod)
+  ota_get_code["777310753.xyz"] = nil
+  fake.tick(10000); boot(); fake.tick(10)
+  eq("cleared", sms_reply(PHONE, signed("#ota clear")), "ota cleared rebooting")
+  fake.tick(10000); boot(); fake.tick(10)
+end
+do   -- 3) a base that SERVED the bytes ends the walk: three bases, the third is never asked
+  fskv.set("bases", "https://dead1.test," .. BASE .. "," .. BASE2)
+  dead_hosts["dead1.test"] = true
+  requests = {}
+  eq("a wrong file hmac stops at the base that served it",
+    sms_reply(PHONE, signed("#ota gw " .. ota_mac("gcm", mod))), "ota fail: hmac")
+  eq("the third base was never asked", #find("/api/ota/get?"), 2)
+  eq("and the refused download wrote no file", ota_file("gw"), nil)
+  dead_hosts["dead1.test"] = nil
+end
+do   -- 4) no usable base at all: say so, rather than an HTTP error from a walk that never ran
+  fskv.set("bases", "not a url")
+  requests = {}
+  eq("#ota with no usable base", sms_reply(PHONE, signed("#ota gw " .. mac)), "ota fail: no base")
+  eq("nothing was requested", #find("/api/ota/get?"), 0)
+end
+fskv.del("bases"); fskv.del("bases_ok"); fskv.del("bases_try")
+boot(); fake.tick(10)
+eq("back on the flashed gw, built-in domains", _G.GW_TAG, nil)
+fake.tick(310000)                                      -- healthy boot: counter back to 0
 
 -- =============================================================================
 print("== 4. OTA gw that crashes in start → reverted after 3 failed boots")
@@ -480,11 +653,11 @@ eq("rescue: first poll", polls(), 1)
 fake.tick(120000)
 eq("rescue: polls every 60 s", polls(), 3)
 eq("rescue: no uploads, no outbox", #find(UPLOAD_PATH) + #find("/api/outbox"), 0)
-fake.sms_incoming(STRANGER, "#status")
+fake.sms_incoming(OTHER, "#status")
 fake.sms_incoming("10086", "ignored in rescue")
 fake.tick(100)
-eq("rescue: stranger #status ignored, SMS not forwarded", #fake.sms_sent .. " " .. #find(UPLOAD_PATH), "0 0")
-eq("rescue: owner #status", sms_reply(OWNER, "#status"), "RESCUE boot_fail=3 ota=- fw=V2050 ver=2.0.0 dev=" .. dev())
+eq("rescue: an unsigned #status is neither answered nor forwarded", #fake.sms_sent .. " " .. #find(UPLOAD_PATH), "0 0")
+eq("rescue: a signed #status falls back to main.lua's own line", sms_reply(PHONE, signed("#status")), "RESCUE boot_fail=3 ota=- fw=V2050 ver=2.0.0 dev=" .. dev())
 fake.tick(150000)   -- 5 min up, polls answered → retry a normal boot
 ok("rescue: retries a normal boot after 5 min with answered polls", fake.rebooted)
 ok("rescue: retry logged", log_has("rescue: retrying a normal boot"))
@@ -520,7 +693,7 @@ ok("rescue while pending: polls answered, nothing run", polls() >= 3 and #find("
 -- Rescue with no network: retry after 15 min regardless.
 offline = true
 fake.sms_sent = {}
-sms_reply(OWNER, "#reboot")
+sms_reply(PHONE, signed("#reboot"))
 ok("rescue: #reboot", fake.rebooted)
 eq("rescue: #reboot is deliberate, counter cleared", fskv.get("boot_fail"), 0)
 crash_boots(2)
@@ -546,8 +719,8 @@ _G.gw_alive = real_alive
 requests = {}
 fake.tick(60000)
 ok("rescue: loop survived the error and polled again", polls() >= 1)
--- OWNER SMS in rescue: #url (bases via gw_cmd), #ota clear, #ota gw <hmac> from the config base.
-eq("rescue: #url stores the bases", sms_reply(OWNER, "#url https://c.test"), "url ok rebooting")
+-- Signed SMS in rescue: #url (bases via cmd_exec), #ota clear, #ota gw <hmac> from the Worker.
+eq("rescue: #url stores the bases", sms_reply(PHONE, signed("#url https://c.test")), "url ok rebooting")
 eq("rescue: #url stored", fskv.get("bases"), "https://c.test")
 -- A `bases` issued from rescue must NOT clear boot_fail: the next boot has to stay rescue so it can
 -- confirm the new domain on its first poll (a normal boot would just re-run the broken flashed gw).
@@ -556,14 +729,14 @@ fake.tick(5000)
 ok("rescue: #url rebooted", fake.rebooted)
 fskv.del("bases"); fskv.del("bases_try")
 boot()   -- boot_fail is still >=3, so this comes straight back up in rescue
-eq("rescue: #ota clear reply", sms_reply(OWNER, "#ota clear"), "ota cleared rebooting")
+eq("rescue: #ota clear reply", sms_reply(PHONE, signed("#ota clear")), "ota cleared rebooting")
 eq("rescue: #ota clear resets boot_fail", fskv.get("boot_fail"), 0)
 fake.tick(10000)
 ok("rescue: #ota clear reboots", fake.rebooted)
 crash_boots(2)
 boot()
 eq("rescue once more", fskv.get("boot_fail"), 3)
-eq("rescue: #ota gw <hmac> downloads from the Worker and installs", sms_reply(OWNER, "#ota gw " .. mac), "ota ok gw " .. #mod .. " rebooting")
+eq("rescue: #ota gw <hmac> downloads from the Worker and installs", sms_reply(PHONE, signed("#ota gw " .. mac)), "ota ok gw " .. #mod .. " rebooting")
 eq("rescue: #ota download url", last("/api/ota/get") and last("/api/ota/get").url, BASE .. "/api/ota/get?dev=" .. dev() .. "&name=gw")
 fake.tick(10000)
 boot()
@@ -575,7 +748,7 @@ do -- fskv.get raising must not kill main.lua before the SMS handler exists
   fskv.get = function() error("flash read error") end
   local bok, berr = pcall(boot)
   ok("boot survives fskv.get raising", bok, berr)
-  ok("main.lua's handler is up: owner #status answered", (sms_reply(OWNER, "#status") or ""):match("^RESCUE boot_fail=") ~= nil)
+  ok("main.lua's handler is up: a signed #status is answered", (sms_reply(PHONE, signed("#status")) or ""):match("^RESCUE boot_fail=") ~= nil)
   fskv.get = real_get
 end
 package.preload["gw"] = nil
@@ -595,7 +768,7 @@ do -- crypto.trng returns NOTHING on failure; indexing it would throw before sys
   fake.tick(60000)
   eq("no identity → nothing on the network", #requests, 0)
   ok("gw says so instead of crashing", log_has("no device identity"))
-  ok("main.lua still up: owner #status answered", (sms_reply(OWNER, "#status") or ""):match("^2%.0%.0 csq=") ~= nil)
+  ok("main.lua still up: a signed #status is answered", (sms_reply(PHONE, signed("#status")) or ""):match("^2%.0%.0 csq=") ~= nil)
   crypto.trng = real_trng
 end
 do -- fskv cannot keep the identity (worn flash): main.lua hands it over in RAM
@@ -695,7 +868,7 @@ do
   -- #url reset clears the override and both markers.
   dead_hosts = {}
   boot(); fake.tick(100)
-  fake.sms_incoming(OWNER, "#url reset")
+  fake.sms_incoming(PHONE, signed("#url reset"))
   fake.tick(100)
   eq("8 #url reset dropped the override", fskv.get("bases"), nil)
   eq("8 #url reset dropped the confirm marker", fskv.get("bases_ok"), nil)
@@ -798,7 +971,7 @@ end
 -- =============================================================================
 -- 8f. A `bases` delete that silently fails on worn flash is tombstoned with ""
 --     (which merged()/ovr_active read as "no override"), not left pinning the
---     dead domain. Also exercises gw.lua's "#url reset" → _G.gw_cmd.url_reset.
+--     dead domain. Also exercises the signed "#url reset" SMS → bases_forget().
 -- =============================================================================
 do
   package.preload["gw"] = nil
@@ -813,10 +986,10 @@ do
   eq("8f override confirmed", fskv.get("bases_ok"), "1")
   local real_del = fskv.del
   fskv.del = function(k) if k == "bases" then return false end; return real_del(k) end
-  fake.sms_incoming(OWNER, "#url reset"); fake.tick(100)   -- through gw.lua → url_reset → bases_forget
+  fake.sms_incoming(PHONE, signed("#url reset")); fake.tick(100)   -- main.lua: bases_forget()
   fskv.del = real_del
   eq("8f the un-deletable bases key was tombstoned with the empty string", fskv.get("bases"), "")
-  eq("8f gw-path #url reset cleared the confirm marker too", fskv.get("bases_ok"), nil)
+  eq("8f #url reset cleared the confirm marker too", fskv.get("bases_ok"), nil)
   boot(); fake.tick(10)
   local r = last("/api/register?") or last("/api/poll?") or {}
   ok("8f the tombstone reads as no override: back on the built-in base", r.url ~= nil and r.url:find(BASE, 1, true) ~= nil)

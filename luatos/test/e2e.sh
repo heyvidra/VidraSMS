@@ -7,8 +7,9 @@
 # to prove byte-for-byte protocol compatibility with the Worker.
 #
 # The device is provisioned the way a real one is: a throwaway config.lua with a
-# fresh random SMS_KEY (+ BASES/TOPIC for the local server and an OWNER for the
-# optional SMS commands). It registers itself, shows up pending, gets trusted here.
+# fresh random SMS_KEY (+ BASES/TOPIC for the local server). It registers itself,
+# shows up pending, gets trusted here. SMS commands need no configuration at all —
+# they are signed with that same SMS_KEY (see smsmac below and luatos/sms-sign.sh).
 #
 # Secrets: TOPIC is read from worker/wrangler.toml and WEB_USER/WEB_PASS from
 # worker/.dev.vars AT RUNTIME — never written into a repo file, never echoed. The
@@ -28,7 +29,7 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/sms-e2e.XXXXXX")"
 mkdir -p "$WORK/gcm" "$WORK/fs"      # fs/ = the fake's writable-FS sandbox (/ota_*.lua)
 
 BODY='验证码 987654，请勿泄露。'   # inbound SMS text (Chinese), asserted verbatim
-OWNER="+8613800138000"
+SMS_FROM="+8613800138000"       # any number: an SMS command is authenticated by its mac
 
 pass() { printf '✅ %s\n' "$1"; }
 fail() { printf '❌ %s\n' "$1" >&2; [ $# -gt 1 ] && printf '   %s\n' "$2" >&2; exit 1; }
@@ -145,7 +146,6 @@ return {
   SMS_KEY = "$KEY",
   BASES = { $3 },
   TOPIC = "$2",
-  OWNER = "$OWNER",
 }
 EOF
 }
@@ -382,11 +382,16 @@ OUT="$(run_driver "$WORK/conf" "$FSKV")"
 [ "$(kv "$OUT" REBOOTED)" = "true" ] || fail "bases cmd must reboot" "$OUT"
 [ "$(cmd_row "$DEV" "$CID")" = "done|rebooting" ] || fail "bases cmds row wrong" "$(cmd_row "$DEV" "$CID")"
 pass "web bases cmd #$CID: HMAC(bases\\n+value) verified, fskv bases = https://127.0.0.1:9,https://127.0.0.1:10, acked, rebooted"
-OUT="$(run_driver "$WORK/conf" "$FSKV" E2E_SMS_FROM="$OWNER" E2E_SMS_TEXT="#url reset" E2E_SMS_AT=1500 E2E_TICK=3000)"
+# The SMS command channel carries the same SMS_KEY signature the web buttons do, just over
+# a different domain tag: mac = first 16 hex of HMAC-SHA256("sms\n" + body). Exactly what
+# luatos/sms-sign.sh prints; the module recomputes it over the body it parsed out.
+smsmac() { printf 'sms\n%s' "$1" | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$KEY" -r | cut -d' ' -f1 | cut -c1-16; }
+RESET_SMS="#url reset $(smsmac '#url reset')"
+OUT="$(run_driver "$WORK/conf" "$FSKV" E2E_SMS_FROM="$SMS_FROM" E2E_SMS_TEXT="$RESET_SMS" E2E_SMS_AT=1500 E2E_TICK=3000)"
 [ "$(kv "$OUT" POLLS)" = "0" ] || fail "with the new bases the local Worker must be unreachable" "$OUT"
 [ "$(kv "$OUT" REBOOTED)" = "true" ] || fail "#url reset must reboot" "$OUT"
 [ "$(kv "$OUT" BASES)" = "nil" ] || fail "#url reset must drop the fskv override" "$OUT"
-pass "next boot polled the new (dead) bases; OWNER '#url reset' dropped the override and rebooted"
+pass "next boot polled the new (dead) bases; signed '#url reset' SMS dropped the override and rebooted"
 
 # =============================================================================
 # 12. Blocked on the web while trusted in RAM → upload 403 → message stays queued;
