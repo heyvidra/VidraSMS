@@ -178,6 +178,12 @@ local function ota_read(name)   -- source string, or nil when no OTA copy exists
 end
 local function ota_exists(name) local f = io.open(ota_path(name), "rb"); if f then f:close() end; return f ~= nil end
 local function ota_remove() for _, n in ipairs(OTA_NAMES) do pcall(os.remove, ota_path(n)) end end
+-- Luatools decides which lib files a project needs by scanning the script TEXT for the word
+-- require followed by a name, and it neither resolves variables nor skips comments. Written the
+-- obvious way, the dynamic call below made it demand a "name.lua" that cannot exist and refuse to
+-- flash with 缺少库文件. Through an alias it is the identical call with nothing to misread — which
+-- is also why no comment in this file spells that call out literally.
+local luaRequire = require
 function _G.load_module(name)
   local src = ota_read(name)
   local chunk, err = src and load(src, "=ota_" .. name)
@@ -185,7 +191,7 @@ function _G.load_module(name)
     local ok, m = pcall(chunk)
     if ok and type(m) == "table" then
       log.info("main", "ota", name, "loaded", #src)
-      package.loaded[name] = m   -- a later require(name) gets the running copy, not the flashed file
+      package.loaded[name] = m   -- a later require of this name gets the running copy, not the flashed file
       return m
     end
     err = m
@@ -193,7 +199,7 @@ function _G.load_module(name)
   if src then   -- half-written or broken copy: drop it, so #status/register never show an OTA copy that is not running
     log.error("main", "ota", name, "unusable, removed:", err); pcall(os.remove, ota_path(name))
   end
-  return require(name)
+  return luaRequire(name)
 end
 _G.gw_ota = {}
 function _G.gw_ota.active()
