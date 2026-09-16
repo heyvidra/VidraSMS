@@ -377,7 +377,7 @@ PAGE=$(curl -s "$BASE/" "${WEB[@]}")
 # decides whether it is shown at all — "重启" alone appears all over the page.
 for w in "待信任" "更新脚本" "已拉黑" "Number(d.boot) > 0" 'id="otaFile"' \
          "短信指令" "短信…" 'id="smsDlg"' 'id="smsCmdBtn"' "SMSTO:" "用上次上传的" \
-         "function qrEncode(" "function qrSvg(" "扫不出来就复制上面那行自己发" \
+         "function qrEncode(" "function qrSvg(" "就在上面换一个二维码格式" "id=\"smsQrFmt\"" "sms:\" + to + \"?body=" \
          "超过单条短信 160 字的额度"; do
     # Here-string, not a pipe: grep -q exits on the first match, and under pipefail the SIGPIPE
     # that gives echo would turn a successful match into a failure.

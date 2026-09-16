@@ -1510,6 +1510,13 @@ const PAGE = `<!doctype html>
     <option value="ota">更新脚本</option>
     <option value="otaclear">清除更新</option>
   </select>
+  <label class="fl" for="smsQrFmt">二维码格式（扫不出来 / 号码跑进正文，就换一个）</label>
+  <select id="smsQrFmt" class="fs">
+    <option value="smsto">SMSTO:（多数扫码 App、Google 相机）</option>
+    <option value="sms">sms:?body=（Android 原生相机、部分国产 ROM）</option>
+    <option value="smsamp">sms:&amp;body=（iPhone 相机）</option>
+    <option value="text">纯文本（扫出来自己复制，最保险）</option>
+  </select>
   <div id="smsUrlWrap" hidden>
     <label class="fl" for="smsUrl">新的服务器地址，多个用逗号分隔（必须 https://）</label>
     <input id="smsUrl" class="fs" placeholder="https://a.example,https://b.example" spellcheck="false" autocomplete="off">
@@ -3186,6 +3193,8 @@ function qrSvg(m){
 const smsDlg = document.getElementById("smsDlg");
 const smsToIn = document.getElementById("smsTo");
 const smsCmdSel = document.getElementById("smsCmdSel");
+const smsQrFmt = document.getElementById("smsQrFmt");
+try { const f = localStorage.getItem("sms_qr_fmt"); if (f) smsQrFmt.value = f; } catch {}
 const smsUrlIn = document.getElementById("smsUrl");
 const smsOtaFile = document.getElementById("smsOtaFile");
 const smsOtaLast = document.getElementById("smsOtaLast");
@@ -3315,11 +3324,23 @@ document.getElementById("smsGo").onclick = async () => {
   if (!to) {
     hint = "没填号码，就只有上面这行 —— 复制它，从任何一部手机发给模组的 SIM 卡号即可。";
   } else {
-    // SMSTO: is what a phone camera and every scanner app map onto "new message, prefilled".
-    const qr = qrEncode("SMSTO:" + to + ":" + line);
+    // No QR-to-SMS convention is universal: SMSTO: is the zxing one most scanner apps take,
+    // Android's own camera wants sms:<n>?body=, iOS sms:<n>&body=, and WeChat/Alipay understand
+    // none of them and hand the whole string over as text. Offer all four and let the phone that
+    // is actually in the room decide — the choice is remembered, so it is a one-time fiddle.
+    const fmt = smsQrFmt.value;
+    const payload =
+      fmt === "sms"    ? "sms:" + to + "?body=" + encodeURIComponent(line) :
+      fmt === "smsamp" ? "sms:" + to + "&body=" + encodeURIComponent(line) :
+      fmt === "text"   ? line :
+                         "SMSTO:" + to + ":" + line;
+    try { localStorage.setItem("sms_qr_fmt", fmt); } catch {}
+    const qr = qrEncode(payload);
     if (qr) {
       smsQr.append(qrSvg(qr));
-      hint = "用手机扫码会打开短信编辑界面，号码和内容已填好，点发送即可；扫不出来就复制上面那行自己发。";
+      hint = fmt === "text"
+        ? "扫出来的就是这行文字，复制到短信里发给模组即可（号码要自己填）。"
+        : "用手机扫码会打开短信编辑界面，号码和内容已填好，点发送即可。号码跑进了正文、或者扫不出来，就在上面换一个二维码格式。";
     } else {
       // Refused, never truncated: half a command with a good-looking mac is worse than none.
       hint = "这行太长，二维码装不下（上限 213 字节）—— 复制上面那行自己发。";
