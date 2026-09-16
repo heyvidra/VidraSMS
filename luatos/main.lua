@@ -83,7 +83,16 @@ end
 
 -- Config = DEFAULTS ← config.lua (REQUIRED: SMS_KEY) ← fskv "bases" (web `bases` command / #url).
 local file_cfg
-do local ok, t = pcall(require, "config"); if ok and type(t) == "table" then file_cfg = t end end
+-- One quoted string on any line that mentions require: Luatools' project scanner takes the
+-- FIRST quote to the LAST quote on such a line as the module name, so the compact pcall form
+-- had it asking for a file called: config"); if ok and type(t) == "table
+local function load_config()
+  return require("config")
+end
+do
+  local ok, t = pcall(load_config)
+  if ok and type(t) == "table" then file_cfg = t end
+end
 local function merged()
   local c = {}
   for _, src in ipairs({ DEFAULTS, file_cfg or {} }) do for k, v in pairs(src) do c[k] = v end end

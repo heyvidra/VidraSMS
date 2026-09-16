@@ -17,6 +17,21 @@ KEY="$(sed -nE 's/^[[:space:]]*SMS_KEY[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p'
 for f in main.lua gw.lua gcm.lua config.lua; do
   luac -p "$HERE/$f" || { echo "$f does not compile" >&2; exit 2; }
 done
+
+# Luatools decides which lib files a project needs by scanning the script TEXT, and on a line that
+# mentions require it reads FIRST-QUOTE-to-LAST-QUOTE as the module name. Two quoted strings on
+# such a line therefore make it demand a file with a nonsense name and refuse to flash --
+# "合并失败: 缺少 ...请添加" -- even with 添加默认lib ticked. That cost a round trip to the person
+# doing the flashing once; never ship a package that trips it again.
+for f in main.lua gw.lua gcm.lua config.lua; do
+  BAD="$(awk '/require/ { n = gsub(/"/, "&"); if (n > 2) printf "%d: %s\n", NR, $0 }' "$HERE/$f")"
+  [ -z "$BAD" ] || {
+    echo "$f: a line mentioning require carries more than one quoted string." >&2
+    echo "  Luatools reads first-quote-to-last-quote as the module name and will refuse to flash." >&2
+    printf '%s\n' "$BAD" >&2
+    exit 2
+  }
+done
 VER="$(sed -nE 's/^VERSION[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$HERE/main.lua" | head -1)"
 [ -n "$VER" ] || { echo "cannot read VERSION from main.lua" >&2; exit 2; }
 

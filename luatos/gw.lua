@@ -24,7 +24,10 @@ local M = {}
 
 -- main.lua's load_module prefers an OTA copy (/ota_gcm.lua) over the flashed
 -- gcm.lua; plain require when gw.lua runs standalone (unit tests).
-local gcm = (_G.load_module and _G.load_module("gcm")) or require("gcm")
+-- Two quoted strings on one line that mentions require confuses Luatools' scanner (it reads
+-- first-quote-to-last-quote as the module name), so the fallback gets its own line.
+local gcm = _G.load_module and _G.load_module("gcm")
+if not gcm then gcm = require("gcm") end
 
 -- Plaintext budget. ceil((3000+28)/3)*4 + 3 = 4043 bytes on the wire, which
 -- also keeps the fskv value (limit 4095) comfortable.
