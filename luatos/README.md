@@ -35,13 +35,13 @@ zip 里 **4 个文件**：
 | `gcm.lua` | 加密。可网页 OTA。 |
 | `config.lua` | **`SMS_KEY` 必填**；`BASES` / `TOPIC` / `NAME` / `POLL_MS` / `CA_PEM` 可选（默认值写死在 `main.lua`）。短信指令不用配置，见 §5。 |
 
-底层固件 `LuatOS-SoC_V2050_Air780EHV_108.soc` 你自己从合宙官网下（§2），**不放进 zip**。
+底层固件 `LuatOS-SoC_V2052_Air780EHV_101.soc` 你自己从合宙官网下（§2），**不放进 zip**。
 `pack.sh` 会拒绝空的 / 占位的 / 全 0 的 `SMS_KEY`。**zip 里含密钥**，只发给帮你刷机的人；`config.lua` 和
 `dist/` 都在根 `.gitignore` 里。
 
 给卖家的话（`pack.sh` 也会打印）：
 
-> 麻烦用 Luatools 刷一下：新建项目 → 底层选 `LuatOS-SoC_V2050_Air780EHV_108.soc`（我自己提供）→
+> 麻烦用 Luatools 刷一下：新建项目 → 底层选 `LuatOS-SoC_V2052_Air780EHV_101.soc`（我自己提供）→
 > 添加 zip 里的 4 个脚本（`main.lua`、`gw.lua`、`gcm.lua`、`config.lua`）→ 勾选「添加默认lib」→
 > 点「下载底层和脚本」→ 下载完在日志里看到 `smsgw` 字样即可。刷完插卡通电即可，不用配置。
 
@@ -60,28 +60,38 @@ zip 里 **4 个文件**：
 
 ---
 
-## 2. 固件（选 108）
+## 2. 固件（选 101）
 
-刷 **`LuatOS-SoC_V2050_Air780EHV_108.soc`**。这个变体（108）同时带齐了本项目要的三样：
+刷 **`LuatOS-SoC_V2052_Air780EHV_101.soc`**。变体 101 带齐了本项目要的东西：
 
 - **`cc` 电话模块** —— 未接来电转发要用它监听 `CC_IND`；
-- **电信短信 / VoLTE 短信**接收；
-- **64 位整数** Lua —— GHASH 更快（代码在 32 位上也正确，见 `gcm.lua` 注释，但 64 位更省心）。
+- **电信短信 / VoLTE 短信**接收（选型表 `sms` 行：`✓ 支持电信`）；
+- **64 位整数** Lua（101–199 号都是 64 位）—— GHASH 更快（代码在 32 位上也正确，见 `gcm.lua`
+  注释，但 64 位更省心）；
+- **`tts` 文字转语音** —— 目前用不上，留着是因为固件变体只有拿着板子才能换，而这是个单向门。
 
-**`8` 也行**（功能齐、只是 32 位）。**别刷 `20` / `120`** —— 那两个变体**砍掉了短信**，
-刷了就一条都收不到。另外只有 `{1,2,8,13,16}` 系列带 `cc`，其它变体**没有来电监听**，
-未接来电转发会失效（短信仍正常）。
+分区：脚本区 512KB、fs 768KB。实际占用典型约 60KB（fskv 队列 + 两个 OTA 副本），够得很。
+
+**之前刷的是 108**（512KB / 1536KB），除了没有 `tts`，我们用到的库和 101 完全一致 —— 换成 101
+纯粹是为了保住以后做语音的可能性，**代码一行没改**。
+
+选变体的红线（数据来自合宙选型手册的
+[LuatOS-API-Core 表](https://docs.openluat.com/air780epm/image/LuatOS-API-Core.png)）：
+`sms` 那一行必须是 **`支持电信`**，`cc` 那一行必须是 **✓**。少任何一个，这个项目的核心功能就没了，
+而且**失败是静默的** —— 一切看着正常，短信就是不来。
 
 固件在合宙资料中心的 [Air780EHV 固件版本页](https://docs.openluat.com/air780ehv/luatos/firmware/version/)
-下载（V2050 的目录：`https://cdn18.luatos.com/files/Air780EHV/LuatOS_Air780EHV/LuatOS-SoC_V2050_Air780EHV/`），
-拿 `_108.soc` 那个。**别用 V2024 之前的版本** —— 那之前 LuatOS 的 AES-GCM
-连 IV 都不生效（本项目绕开了它，但没必要踩老固件的坑）。
+下载，目录 `https://cdn18.luatos.com/files/Air780EHV/LuatOS_Air780EHV/LuatOS-SoC_V2052_Air780EHV/`，
+拿 `_101.soc` 那个（11,940,814 字节，
+sha256 `4a4f1ba3e594ff505091eab9862885194d1512c7c07af6ecfc6b2f05feb6aa5d`）。
+**别用 V2024 之前的版本** —— 那之前 LuatOS 的 AES-GCM 连 IV 都不生效（本项目绕开了它，
+但没必要踩老固件的坑）。
 
 ### Luatools 步骤（自己刷时）
 
 1. 装 **Luatools**（合宙官方下载/烧录工具，Windows）。
 2. USB 连上模组，Luatools 会自动认端口。
-3. **第一次**：选「下载底层和脚本」，底层选刚下的 `LuatOS-SoC_V2050_Air780EHV_108.soc`，
+3. **第一次**：选「下载底层和脚本」，底层选刚下的 `LuatOS-SoC_V2052_Air780EHV_101.soc`，
    脚本添加 `main.lua` / `gw.lua` / `gcm.lua` / `config.lua`，勾选「添加默认lib」，下载。
 4. 之后**不需要再连 USB**：改 `gw.lua` / `gcm.lua` 用网页「更新脚本」（§4）。
    真要用线刷也只需「下载脚本」，秒传。
@@ -201,7 +211,7 @@ bash luatos/sms-sign.sh "$(bash luatos/test/ota-sign.sh gw)"    # → #ota gw <�
 
 | 指令 | 作用 |
 |---|---|
-| `#status` | 回一条：`2.1.0 csq=20 net=1 ip=10.x.x.x q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=0 utc=14 win=fast`（信号 / 网络 / IP / 排队条数 / 加密自检 / 固件 / **信任状态** / OTA 副本 / 启动计数 / **模块看到的 UTC 小时** / **当前档位**）。`utc=` 和 `win=` 是判断 RTC 是否走偏的唯一手段 —— 时钟错了两个窗口一起平移，症状只有「有些天指令好像慢一点」。这行由 `gw.lua` 提供（`_G.gw_status_line`）；救援模式或 `gw.lua` 没起来时由 `main.lua` 自己回 `RESCUE boot_fail=… ota=… fw=… ver=… dev=…`。 |
+| `#status` | 回一条：`2.1.0 csq=20 net=1 ip=10.x.x.x q=0 gcm=ok fw=V2052 trust=trusted ota=- boot=0 utc=14 win=fast`（信号 / 网络 / IP / 排队条数 / 加密自检 / 固件 / **信任状态** / OTA 副本 / 启动计数 / **模块看到的 UTC 小时** / **当前档位**）。`utc=` 和 `win=` 是判断 RTC 是否走偏的唯一手段 —— 时钟错了两个窗口一起平移，症状只有「有些天指令好像慢一点」。这行由 `gw.lua` 提供（`_G.gw_status_line`）；救援模式或 `gw.lua` 没起来时由 `main.lua` 自己回 `RESCUE boot_fail=… ota=… fw=… ver=… dev=…`。 |
 | `#reboot` | 重启（主动重启，清零计数，不回复）。 |
 | `#url https://a,https://b` | 等价于网页「改域名」：校验、存 fskv、回 `url ok rebooting`、5 秒后重启。整条短信已经用 `SMS_KEY` 签过了，所以这里不用再套一层网页那种 `bases` 签名。 |
 | `#url reset` | 清掉上面的覆盖和两个标记，回到 `config.lua` / 默认域名，重启（不回复）。 |

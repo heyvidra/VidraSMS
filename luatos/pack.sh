@@ -56,7 +56,7 @@ echo "this zip CONTAINS your SMS_KEY — send it only to the person flashing the
 echo
 cat <<'TXT'
 ———— 粘贴给卖家 ————
-麻烦用 Luatools 刷一下：新建项目 → 底层选 LuatOS-SoC_V2050_Air780EHV_108.soc（我自己提供）→
+麻烦用 Luatools 刷一下：新建项目 → 底层选 LuatOS-SoC_V2052_Air780EHV_101.soc（我自己提供）→
 添加 zip 里的 4 个脚本（main.lua、gw.lua、gcm.lua、config.lua）→ 勾选「添加默认lib」→
 点「下载底层和脚本」→ 下载完在日志里看到 smsgw 字样即可。
 
