@@ -905,12 +905,20 @@ export default {
     // Prune deletion rows older than a week — every phone polling within that window has seen them.
     await env.DB.prepare("DELETE FROM deletions WHERE ts < ?").bind(Date.now() - 7 * 86_400_000).run();
     // Backstop for stuck sends: the poll-path only fails a row out when a phone actually polls, so
-    // a phone that goes offline mid-send leaves its row "发送中" forever. Fail any send still
-    // sending well past the claim window (20-min grace lets a briefly-offline phone resume first).
+    // a phone that goes offline mid-send leaves its row "发送中" forever.
+    //
+    // outbox.ts is the INSERT time and the claim never touches it, so this grace period is really
+    // "time since the row was written", not "time since it was claimed". At a 30 s poll that was
+    // the same thing to within half a minute; on the module's slow tier a row written at 22:05 is
+    // not claimed until 22:15, and a lost ack would then see this cron mark it 失败 somewhere
+    // between 20 and 35 minutes — overruling the two retries that failout/stale (MAX_CLAIMS) are
+    // there to give it, and putting "发送未完成" on screen for an SMS that actually went out.
+    // The claims guard puts this back to what the comment always claimed: only rows that already
+    // burned their retry budget.
     await env.DB.prepare(
       "UPDATE outbox SET status='failed', detail='发送未完成（手机离线/被杀），已超时' " +
-      "WHERE status='sending' AND ts <= ?"
-    ).bind(Date.now() - 20 * 60_000).run();
+      "WHERE status='sending' AND ts <= ? AND claims >= ?"
+    ).bind(Date.now() - 20 * 60_000, MAX_CLAIMS).run();
     const row = await env.DB.prepare("SELECT v FROM meta WHERE k='keepalive'").first();
     if (!row) return;
     let k; try { k = JSON.parse(row.v); } catch { return; }
@@ -1906,6 +1914,11 @@ function applyDevFilter(){
 // on phones that were merely dozing. Four missed polls is a genuine outage; two is a nap. Actual
 // freezing is reported separately and precisely by the gap counters, which is the better signal.
 const ONLINE_MS = 20 * 60000;
+// The module polls on a schedule, not continuously: 120 s in the UTC 06-22 window and 600 s
+// outside it. Judging it by the phone's 20-minute rule paints the card red every night for a
+// module that is working perfectly — and worst, at exactly the hour the owner last checks the
+// page. Four missed slow-tier polls is a real fault; two is bedtime.
+const MODULE_ONLINE_MS = 45 * 60000;
 const ago = (ms) => {
   const m = Math.floor(ms / 60000);
   if (m < 1) return "不到 1 分钟";
@@ -2095,7 +2108,7 @@ async function renderBeat(){
   }
   for (const d of DEVS.values()) {
     const age = Date.now() - d.ts;
-    const on = age < ONLINE_MS;
+    const on = age < (d.module ? MODULE_ONLINE_MS : ONLINE_MS);
     // Liveness (the dot) and capability (can it still capture an SMS) are different questions: an
     // incoming SMS wakes even a frozen phone, so a dead poll does not mean lost messages. Show
     // them as two states. Any armed capture path — the notification listener, the default-SMS
@@ -2151,9 +2164,13 @@ async function renderBeat(){
       const cap = document.createElement("div"); cap.className = "dev-warn";
       cap.textContent = "⚠ 收不到短信 · 检查通知访问/默认短信应用";
       sub.append(cap);
-    } else if (canForward === true && !on) {
+    } else if ((canForward === true || d.module) && !on) {
       // Online + working needs no line — the green dot already says it. The reassurance is only
-      // worth showing when the phone is OFFLINE, so the red dot isn't misread as "stopped receiving".
+      // worth showing when the device is OFFLINE, so the red dot isn't misread as "stopped receiving".
+      // The module needs it more than any phone does: its register blob carries no caps (name,
+      // imei, iccid, imsi, num, fw, ver, ota, boot — no capability fields), so canForward is null
+      // and without the d.module arm it got a red dot and no explanation at all. Inbound SMS is
+      // pushed the moment it arrives, so a sleeping poll really does forward nothing more slowly.
       const cap = document.createElement("div"); cap.className = "dev-cap";
       cap.textContent = "● 仍可接收转发（离线只是轮询睡了）";
       sub.append(cap);
