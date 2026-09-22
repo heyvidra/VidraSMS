@@ -6,10 +6,12 @@ package.path = "luatos/?.lua;luatos/test/?.lua;" .. package.path
 require("fake_crypto")
 local gcm = require("gcm")
 
-local VECTORS = os.getenv("GCM_VECTORS")
-  or "/private/tmp/claude-501/-Users-sidym-Workspace-abc/5f75b85b-8ab7-41fe-9c46-af86ca13d16f/scratchpad/gcm/vectors.json"
-local SCRATCH = os.getenv("GCM_SCRATCH")
-  or "/private/tmp/claude-501/-Users-sidym-Workspace-abc/5f75b85b-8ab7-41fe-9c46-af86ca13d16f/scratchpad/gcm/tmp"
+-- Group A's known-answer vectors. They used to live in a scratch directory that no longer
+-- exists, which silently turned group A into a stack trace. Keep them beside the suite and
+-- regenerate with Node when absent: the KATs only have to come from an implementation that is
+-- not ours, and node:crypto is exactly that.
+local VECTORS = os.getenv("GCM_VECTORS") or "luatos/test/.gcm-vectors.json"
+local SCRATCH = os.getenv("GCM_SCRATCH") or "luatos/test/.gcm-tmp"
 
 local fails = 0
 local function group(name, ok, detail)
@@ -19,6 +21,23 @@ end
 
 local function fromhex(h) return string.fromHex(h) end
 local function tohex(s) return (select(1, string.toHex(s))):lower() end
+
+local function ensure_vectors(path)
+  local f = io.open(path, "rb")
+  if f then f:close(); return end
+  os.execute(string.format([[node -e '
+const c=require("crypto");
+const key=c.randomBytes(32), cases=[];
+for (const n of [0,1,15,16,17,31,32,33,63,64,100,255,256,1000,3000]) {
+  const iv=c.randomBytes(12), pt=c.randomBytes(n);
+  const ci=c.createCipheriv("aes-256-gcm",key,iv);
+  const ct=Buffer.concat([ci.update(pt),ci.final()]), tag=ci.getAuthTag();
+  cases.push({iv:iv.toString("hex"),pt_hex:pt.toString("hex"),
+              v1:"v1:"+Buffer.concat([iv,ct,tag]).toString("base64")});
+}
+process.stdout.write(JSON.stringify({key_hex:key.toString("hex"),cases}));
+' > %q]], path))
+end
 
 local function run(cmd)
   local f = assert(io.popen(cmd, "r"))
@@ -40,7 +59,9 @@ end
 
 -- ---- (A) vectors.json -----------------------------------------------------
 do
-  local dump = run("node -e 'const v=require(process.argv[1]);"
+  ensure_vectors(VECTORS)
+  -- readFileSync, not require(): node treats a bare relative path as a module name.
+  local dump = run("node -e 'const v=JSON.parse(require(\"fs\").readFileSync(process.argv[1],\"utf8\"));"
     .. "let o=v.key_hex+\"\\n\";for(const c of v.cases)o+=c.iv+\"\\t\"+c.pt_hex+\"\\t\"+c.v1+\"\\n\";"
     .. "process.stdout.write(o)' '" .. VECTORS .. "'")
   local lines = split_lines(dump)
@@ -84,6 +105,7 @@ do
     cases[i] = { key = key, pt = pt, v1 = v1lua }
     tsv[i] = tohex(key) .. "\t" .. tohex(iv) .. "\t" .. tohex(pt) .. "\t" .. v1lua
   end
+  os.execute(string.format("mkdir -p %q", SCRATCH))
   local tsvpath = SCRATCH .. "/xcheck_cases.tsv"
   local jspath = SCRATCH .. "/xcheck.js"
   write_file(tsvpath, table.concat(tsv, "\n") .. "\n")

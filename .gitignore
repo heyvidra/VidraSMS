@@ -23,3 +23,7 @@ android/keystore.properties
 
 # macOS
 .DS_Store
+
+# gcm KAT vectors + scratch, regenerated on demand by luatos/test/test_gcm.lua
+luatos/test/.gcm-vectors.json
+luatos/test/.gcm-tmp/
