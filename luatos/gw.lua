@@ -41,8 +41,25 @@ local UPLOAD_TIMEOUT = 10000
 local POLL_TIMEOUT = 15000
 local ACK_TIMEOUT = 15000
 local SEND_WAIT = 45000
-local REGISTER_EVERY_MS = 30 * 60000
-local POLL_FAIL_REBOOT = 20
+-- The poll itself refreshes last-seen (pollStatements' stamp) and a 403/404 sets reg_due, so
+-- this tick only refreshes the card's ls/ota/boot/csq fields. At 6 h it costs 0.7 MB/month
+-- instead of 9; the cost is that those four fields can be up to 6 h stale.
+local REGISTER_EVERY_MS = 6 * 3600000
+-- Failures counted in TIME, not in attempts. As a count of 20 it meant ~10 minutes at the old
+-- 30 s interval; on the slow tier 20 attempts would span ten hours before the module gave up.
+local POLL_FAIL_MS = 3600000   -- overridable via cfg.POLL_FAIL_MS
+-- Poll schedule. The window is UTC because the module's os.time() IS UTC (gw.lua renders China
+-- time by adding 8 h explicitly, see format_body). 06:00-22:00 UTC reads as 06-22 in GMT and
+-- 07-23 in BST, so both halves of the year land on sane waking hours and no DST rule is needed.
+-- Inbound SMS is pushed the instant it arrives, so none of this touches forwarding latency —
+-- it only decides how fast an outbound SMS or a command reaches the module.
+local POLL_FAST_MS = 120000    -- re-read from cfg.POLL_MS in M.start
+local POLL_SLOW_MS = 600000
+local FAST_FROM_H = 6          -- inclusive, UTC
+local FAST_TO_H = 22           -- exclusive, UTC
+local BOOT_FAST_MS = 600000    -- first 10 min of every boot: fast, whatever the clock says
+local WAIT_CHUNK_MS = 60000    -- slice long sleeps; a single 600 s sys.wait is unproven here
+local POLL_BACKOFF_MAX_MS = 900000
 local PREFIX_AFTER_S = 120     -- Android: [原时间] only when uploaded ≥120 s after receipt
 local CLOCK_VALID_S = 1e9      -- os.time() below this = RTC not yet NITZ-synced
 
@@ -206,6 +223,21 @@ end
 -- Base list from config (table or string; comma/space separated). http:// is
 -- accepted for local testing; the web `bases` command and #url are validated
 -- (https only) in main.lua before they ever reach fskv.
+-- now = os.time() (UTC seconds), up_ms = milliseconds this boot has been polling.
+-- Pure, so test_gw can sweep it. Every failure path returns the FAST interval: being wrong in
+-- the expensive direction keeps the module reachable, being wrong in the cheap direction makes
+-- it unreachable for ten minutes at a time with no way to tell why.
+function M.poll_interval(now, up_ms)
+  if type(up_ms) == "number" and up_ms == up_ms and up_ms < BOOT_FAST_MS then return POLL_FAST_MS end
+  if type(now) ~= "number" or now ~= now or now < CLOCK_VALID_S then return POLL_FAST_MS end
+  -- "!" is UTC. Dropping it would silently read a local time the module does not have.
+  local ok, h = pcall(os.date, "!%H", math.floor(now))
+  h = ok and tonumber(h) or nil
+  if not h then return POLL_FAST_MS end
+  if h >= FAST_FROM_H and h < FAST_TO_H then return POLL_FAST_MS end
+  return POLL_SLOW_MS
+end
+
 function M.parse_bases(v)
   local out = {}
   local function add(s)
@@ -238,6 +270,8 @@ local next_seq = 1
 local ring = ""           -- mirror of fskv "done"
 local last_send = ""      -- register "ls"
 local poll_fail = 0
+local poll_fail_ms = 0      -- wall time spent failing, not attempts (see POLL_FAIL_MS)
+local last_interval = 0     -- the sleep just served, so poll_fail_ms advances in real time
 local polls = 0
 local ringing = false
 local sim_label_cache
@@ -246,7 +280,6 @@ local trusted = false     -- the web has trusted this device (uploads + sends al
 local trust = "?"         -- last status the Worker reported: pending | trusted | blocked | ?
 local serving             -- base that last answered a poll
 local reg_due = true      -- register at boot, every REGISTER_EVERY_MS, and after a trust change
-local reg_polls = 0
 
 _G.GCM_OK = false         -- read by #status; false disables every upload
 
@@ -576,7 +609,7 @@ local function register()
       local st = (ok and type(t) == "table" and type(t.status) == "string") and t.status or "?"
       log.info("gw", "registered:", st)
       set_trust(st, false)
-      reg_due, reg_polls = false, 0
+      reg_due = false
       return
     end
     log.warn("gw", "register failed", code, b)
@@ -597,12 +630,16 @@ local function run_cmd(base, cmd)
 end
 
 local function poll_once()
-  for _, base in ipairs(bases) do
+  -- The serving base first, like upload_once and register already do. Without this, a bases[1]
+  -- that is dead-but-answering (a parked page, a Cloudflare error page, a captive portal — all
+  -- realistic for a .xyz resolved from China) makes EVERY poll pay for a wasted connection
+  -- first, silently doubling the monthly bill with nothing in poll_fail to show for it.
+  for _, base in ipairs(targets(serving or bases[1])) do
     local code, _, body = http_req("GET", base .. "/api/poll?dev=" .. dev_id, auth_headers(), nil, POLL_TIMEOUT)
     if code == 200 then
       local p = M.parse_poll(body)
       if p then
-        poll_fail, serving = 0, base
+        poll_fail, poll_fail_ms, serving = 0, 0, base
         polls = polls + 1
         if _G.gw_alive then _G.gw_alive() end   -- main.lua's boot health: the server answered
         set_trust(p.status, true)
@@ -625,8 +662,9 @@ local function poll_once()
     end
   end
   poll_fail = poll_fail + 1
-  if poll_fail >= POLL_FAIL_REBOOT then
-    log.error("gw", "poll failed " .. poll_fail .. " times in a row; rebooting")
+  poll_fail_ms = poll_fail_ms + (last_interval or 0)
+  if poll_fail_ms >= POLL_FAIL_MS then
+    log.error("gw", "poll failing for " .. math.floor(poll_fail_ms / 60000) .. " min; rebooting")
     -- This boot was fine, only the network was not: clear main.lua's counter so
     -- an outage cannot walk a healthy module into rescue mode (where inbound SMS
     -- are dropped) three reboots later. While an OTA copy is active the counter
@@ -640,13 +678,36 @@ end
 
 local function poller()
   wait_ip()
-  local every = math.max(1, math.floor(REGISTER_EVERY_MS / (cfg.POLL_MS or 30000)))
+  local up, reg_at = 0, nil
   while true do
-    if reg_due or reg_polls >= every then perr("register", pcall(register)) end
+    -- Register on demand (403/404 set reg_due) or every REGISTER_EVERY_MS of real time. The
+    -- stamp only moves on success: otherwise one transient failure parks the card's ls/ota/
+    -- boot/csq for the whole 6-hour period.
+    if reg_due or not reg_at or (up - reg_at) >= REGISTER_EVERY_MS then
+      local rok, rerr = pcall(register)
+      perr("register", rok, rerr)
+      if rok and not reg_due then reg_at = up end
+    end
+    -- Poll BEFORE sleeping. This is what puts the first poll of every boot within seconds of
+    -- IP_READY, which is what satisfies main.lua's ALIVE_MAX_MS gate (alive is a latch: one
+    -- answered poll per boot is enough, so the interval below can be as long as we like).
     perr("poll", pcall(poll_once))
-    reg_polls = reg_polls + 1
     collectgarbage()
-    sys.wait(cfg.POLL_MS or 30000)
+    -- Everything from here to the sleep is new arithmetic sitting inside forever()'s retry
+    -- loop, and wait_ip() returns immediately once the link is up: an error thrown before the
+    -- first sys.wait would become a 5-second register+poll loop, ~190 MB/day. Hence the pcall
+    -- and the hard fallback.
+    local iv = POLL_FAST_MS
+    local sok, v = pcall(M.poll_interval, os.time(), up)
+    if sok and type(v) == "number" and v >= 60000 then iv = v end
+    if poll_fail > 0 then iv = math.min(iv * poll_fail, POLL_BACKOFF_MAX_MS) end
+    last_interval = iv
+    local slept = 0
+    while slept < iv do
+      local chunk = math.min(WAIT_CHUNK_MS, iv - slept)
+      sys.wait(chunk); slept = slept + chunk
+    end
+    up = up + iv
   end
 end
 
@@ -662,9 +723,16 @@ local function status_line()
   -- ota= / boot= come from main.lua (OTA scripts active, failed-boot counter);
   -- "-" / 0 when gw.lua runs standalone.
   local ota = _G.gw_ota and safe(_G.gw_ota.active) or "-"
-  return string.format("%s csq=%s net=%s ip=%s q=%d gcm=%s fw=%s trust=%s ota=%s boot=%d",
+  -- utc/win are the only way to tell a plausible-but-wrong RTC from a correct one: a shifted
+  -- clock moves both windows and the only symptom is "commands feel slow some days".
+  local now = os.time()
+  local hh = "-"
+  if type(now) == "number" and now >= CLOCK_VALID_S then hh = safe(os.date, "!%H", math.floor(now)) end
+  local iv = M.poll_interval(now, BOOT_FAST_MS)
+  return string.format("%s csq=%s net=%s ip=%s q=%d gcm=%s fw=%s trust=%s ota=%s boot=%d utc=%s win=%s",
     tostring(M.VERSION), safe(mobile.csq), safe(mobile.status), ip, #queue,
-    _G.GCM_OK and "ok" or "FAIL", safe(rtos.version), trust, ota, tonumber(kv_get("boot_fail")) or 0)
+    _G.GCM_OK and "ok" or "FAIL", safe(rtos.version), trust, ota, tonumber(kv_get("boot_fail")) or 0,
+    hh, iv == POLL_FAST_MS and "fast" or "slow")
 end
 
 -- Every message that reaches gw.lua is an ordinary message: main.lua's callback has
@@ -717,6 +785,16 @@ end
 
 function M.start(c)
   cfg = c or {}
+  -- Keep main.lua:18 / config.lua's POLL_MS a live knob rather than a tombstone: it is the
+  -- fast-tier value, and also the floor a reverted OTA falls back to.
+  -- Honour it, do not second-guess it: the budget is protected by main.lua's DEFAULTS being
+  -- 120000, not by silently overriding a value someone deliberately set. The floor only rejects
+  -- a typo (a bare "30" meaning 30 ms would be ~13 GB/month).
+  local pm = tonumber(cfg.POLL_MS)
+  if pm and pm >= 10000 then POLL_FAST_MS = pm
+  elseif pm then log.error("gw", "POLL_MS " .. tostring(pm) .. " is below 10 s — ignoring it") end
+  local pf = tonumber(cfg.POLL_FAIL_MS)
+  if pf and pf >= 60000 then POLL_FAIL_MS = pf end
   M.VERSION = _G.VERSION or "0.0.0"
   local ver, bsp = "?", "?"
   pcall(function() ver = rtos.version(); bsp = rtos.bsp() end)

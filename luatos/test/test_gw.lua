@@ -202,6 +202,13 @@ p = gw.parse_poll(' \n{ "status" : "trusted", "rows": [ {"id": 99 , "payload" : 
 eq("whitespace and unicode escape", p.rows[1].payload, "v1:中")
 
 -- ---- parse_bases ---------------------------------------------------------------------
+-- status_line's utc=/win= track the real clock, so compute the expected suffix rather than
+-- hardcoding an hour — otherwise this suite only passes between 06:00 and 07:00 UTC.
+local function winsuf()
+  local h = tonumber(os.date("!%H"))
+  return string.format(" utc=%02d win=%s", h, (h >= 6 and h < 22) and "fast" or "slow")
+end
+
 print("== parse_bases")
 local b = gw.parse_bases("https://a.com/, https://b.com ,ftp://x , http://127.0.0.1:8787/")
 eq("bases count", #b, 3)
@@ -300,8 +307,8 @@ do
   eq("register bearer is the device secret", reg.headers["Authorization"], "Bearer " .. secret)
   eq("register content-type", reg.headers["Content-Type"], "text/plain; charset=utf-8")
   eq("register blob decrypts to the exact self-description", gcm.open(key32, reg.body),
-    '{"n":"Air780EHV","s":[{"slot":0,"name":"SIM 1 · 中国电信"}],"t":"4G","os":"LuatOS V2050 Air780EHV","v":"2.0.0","ls":""'
-    .. ',"imei":"861234567890123","iccid":"89860012345678901234","imsi":"460110123456789","num":"","fw":"V2050","ver":"2.0.0","ota":"-","boot":1}')
+    '{"n":"Air780EHV","s":[{"slot":0,"name":"SIM 1 · 中国电信"}],"t":"4G","os":"LuatOS V2050 Air780EHV","v":"2.1.0","ls":""'
+    .. ',"imei":"861234567890123","iccid":"89860012345678901234","imsi":"460110123456789","num":"","fw":"V2050","ver":"2.1.0","ota":"-","boot":1}')
   eq("poll url", find("/api/poll")[1].url, "https://x.test/api/poll?dev=" .. st.dev_id)
   eq("poll bearer", find("/api/poll")[1].headers["Authorization"], "Bearer " .. secret)
   eq("poll is a GET", find("/api/poll")[1].method, "GET")
@@ -314,7 +321,7 @@ do
   eq("pending: nothing uploaded", #find("/sms-t"), 0)
   eq("pending: no devinfo any more", #find("/api/devinfo"), 0)
   eq("signed #status while pending", (function() fake.sms_sent = {}; fake.sms_incoming(PHONE, signed("#status")); fake.tick(10); return fake.sms_sent[1] and fake.sms_sent[1].body end)(),
-    "2.0.0 csq=20 net=1 ip=10.0.0.2 q=1 gcm=ok fw=V2050 trust=pending ota=- boot=1")
+    "2.1.0 csq=20 net=1 ip=10.0.0.2 q=1 gcm=ok fw=V2050 trust=pending ota=- boot=1" .. winsuf())
 
   -- Trusted on the web: the next poll sees it → queue drains → re-register on the following cycle.
   status = "trusted"
@@ -356,7 +363,7 @@ do
   fake.tick(10)
   eq("signed command not uploaded", #find("/sms-t"), 0)
   eq("status reply sent", #fake.sms_sent, 1)
-  eq("status reply exact", fake.sms_sent[1].body, "2.0.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=1")
+  eq("status reply exact", fake.sms_sent[1].body, "2.1.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=1" .. winsuf())
   ok("the rich line is gw.lua's hook", type(_G.gw_status_line) == "function")
   eq("the hook is what answered", _G.gw_status_line(), fake.sms_sent[1].body)
   -- An UNSIGNED "#status" — from any number at all — is an ordinary message: gw.lua
@@ -614,7 +621,7 @@ do
   eq("OTA gw runs after the reboot", _G.GW_TAG, "ota")
   eq("register now reports ota=gw", gcm.open(key32, find("/api/register")[1].body):match('"ota":"gw"') ~= nil, true)
   eq("signed #status shows ota=gw", (function() fake.sms_sent = {}; fake.sms_incoming(PHONE, signed("#status")); fake.tick(10); return fake.sms_sent[1] and fake.sms_sent[1].body end)(),
-    "2.0.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=gw boot=1")
+    "2.1.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=gw boot=1" .. winsuf())
   _G.GW_TAG = nil
 
   -- ---- the web pressed 忘记: the devices row is gone --------------------------------
@@ -689,6 +696,76 @@ do
   base.SMS_KEY = ("00112233445566778899aabbccddeeff"):rep(2)
   gw.start(base)
   ok("GCM_OK true on a valid key", _G.GCM_OK == true)
+end
+
+-- =============================================================================
+print("== poll schedule: the UTC window, the boot warm-up, and every failure path")
+do
+  -- 1789999380 = 2026-09-21 14:03:00 UTC. The module's own clock is UTC (its boot log's
+  -- TIME_SYNC value decodes to UTC while China read 22:03), so the window is read straight
+  -- off os.time() with no zone maths.
+  local H = 3600
+  local T14, T23, T04, T06 = 1789999380, 1789999380 + 9*H, 1789999380 + 14*H, 1789999380 + 16*H
+  local FAR = 24 * H * 1000     -- well past BOOT_FAST_MS
+  local FAST = gw.poll_interval(T14, FAR)
+  eq("14:00 UTC is the fast tier", FAST, 30000)          -- cfg.POLL_MS from this suite's config
+  eq("23:00 UTC is the slow tier", gw.poll_interval(T23, FAR), 600000)
+  eq("04:00 UTC is the slow tier", gw.poll_interval(T04, FAR), 600000)
+  eq("06:00 UTC is fast again (window is inclusive at 6)", gw.poll_interval(T06, FAR), FAST)
+  -- The boot warm-up is what keeps the first poll of every boot close enough together to
+  -- satisfy main.lua's ALIVE_MAX_MS gate even if that first attempt fails at 3 a.m.
+  eq("boot warm-up overrides the slow tier at 0 ms", gw.poll_interval(T23, 0), FAST)
+  eq("boot warm-up still applies at 9m59s", gw.poll_interval(T23, 599999), FAST)
+  eq("boot warm-up ends at 10 min", gw.poll_interval(T23, 600000), 600000)
+  -- Every failure path must fail FAST: being wrong in the expensive direction keeps the
+  -- module reachable; being wrong in the cheap direction hides it for ten minutes at a time.
+  eq("clock not yet NITZ-synced → fast", gw.poll_interval(0, FAR), FAST)
+  eq("nil clock → fast", gw.poll_interval(nil, FAR), FAST)
+  eq("NaN clock → fast", gw.poll_interval(0/0, FAR), FAST)
+  eq("nil up_ms is not treated as a warm-up", gw.poll_interval(T23, nil), 600000)
+end
+
+-- =============================================================================
+-- upload_once and register have always walked targets(serving or …); poll_once walked the raw
+-- bases list. A bases[1] that is dead-but-answering (a parked page, a CF error page, a captive
+-- portal — all realistic for a .xyz resolved from China) then made EVERY poll pay for a wasted
+-- connection first: poll_once still returned true, poll_fail still reset, no guard fired, and the
+-- monthly bill quietly doubled.
+print("== poll_once prefers the serving base")
+do
+  local key_hex = ("00112233445566778899aabbccddeeff"):rep(2)
+  local reqs = {}
+  fake.http_mock = function(method, url)
+    reqs[#reqs + 1] = { method = method, url = url }
+    if url:find("bad.test", 1, true) then return 200, {}, "<html>domain for sale</html>" end
+    if url:find("/api/register", 1, true) then return 200, {}, '{"status":"trusted"}' end
+    if url:find("/api/poll", 1, true) then return 200, {}, '{"status":"trusted","rows":[],"cmd":null}' end
+    return 404, {}, "not found"
+  end
+  local function polls_to(host)
+    local n = 0
+    for _, r in ipairs(reqs) do
+      if r.url:find("/api/poll", 1, true) and r.url:find(host, 1, true) then n = n + 1 end
+    end
+    return n
+  end
+  fskv.clear()
+  fake.no_run = true
+  fake.config = { BASES = { "https://bad.test", "https://good.test" }, TOPIC = "sms-t",
+                  SMS_KEY = key_hex, NAME = "Air780EHV", POLL_MS = 30000 }
+  fake.reboot_cycle()
+  fake.tick(35000)
+  ok("first poll has to try the dead base", polls_to("bad.test") >= 1)
+  ok("and falls through to the one that answers properly", polls_to("good.test") >= 1)
+  reqs = {}
+  fake.tick(35000)
+  local first
+  for _, r in ipairs(reqs) do
+    if r.url:find("/api/poll", 1, true) then first = r.url; break end
+  end
+  ok("the next poll goes straight to the serving base", first ~= nil and first:find("good.test", 1, true) ~= nil)
+  eq("and pays for exactly one connection", polls_to("bad.test"), 0)
+  fake.http_mock = nil
 end
 
 fake.fs_destroy()

@@ -63,7 +63,9 @@ local function signed(body) return body .. " " .. sms_mac(body) end
 local UPLOAD_PATH = "/sms-7f3a9c2b1e0d?dev="        -- baked-in default TOPIC
 local BASE = "https://777310753.xyz"                 -- first baked-in default base
 local function ota_mac(name, body) return crypto.hmac_sha256(name .. "\n" .. body, key1raw) end
-local CONFIG = { SMS_KEY = KEY1 }                    -- everything else = main.lua DEFAULTS
+-- POLL_MS/POLL_FAIL_MS are pinned small so the fake's virtual clock does not have to step
+-- through hours. Section 9 boots WITHOUT them to assert the values that actually ship.
+local CONFIG = { SMS_KEY = KEY1, POLL_MS = 30000, POLL_FAIL_MS = 300000 }
 
 -- The mocked Worker: register/poll answer `status`; a trusted poll carries `rows` + `cmd`;
 -- /api/ota/get serves `ota_files`; `offline` makes every request fail like no network.
@@ -96,6 +98,12 @@ end
 local function find(sub) local t = {}; for _, r in ipairs(requests) do if r.url:find(sub, 1, true) then t[#t + 1] = r end end; return t end
 local function last(sub) local t = find(sub); return t[#t] end
 local function polls() return #find("/api/poll?") end
+-- status_line's utc=/win= track the real clock, so compute the expected suffix rather than
+-- hardcoding an hour — otherwise this suite only passes between 06:00 and 07:00 UTC.
+local function winsuf()
+  local h = tonumber(os.date("!%H"))
+  return string.format(" utc=%02d win=%s", h, (h >= 6 and h < 22) and "fast" or "slow")
+end
 local function next_poll() local n = polls_seen; repeat fake.tick(1000) until polls_seen > n end
 local function boot()
   requests, fake.sms_sent, _G.GW_TAG = {}, {}, nil
@@ -120,8 +128,8 @@ local function web_cmd(payload)
   return a and a.body, cmd_id
 end
 local function reg_json(sim, ls, ota, bootn)
-  return '{"n":"Air780EHV","s":[{"slot":0,"name":"' .. sim .. '"}],"t":"4G","os":"LuatOS V2050 Air780EHV","v":"2.0.0","ls":"' .. ls .. '"'
-    .. ',"imei":"861234567890123","iccid":"89860012345678901234","imsi":"460110123456789","num":"","fw":"V2050","ver":"2.0.0","ota":"' .. ota .. '","boot":' .. bootn .. '}'
+  return '{"n":"Air780EHV","s":[{"slot":0,"name":"' .. sim .. '"}],"t":"4G","os":"LuatOS V2050 Air780EHV","v":"2.1.0","ls":"' .. ls .. '"'
+    .. ',"imei":"861234567890123","iccid":"89860012345678901234","imsi":"460110123456789","num":"","fw":"V2050","ver":"2.1.0","ota":"' .. ota .. '","boot":' .. bootn .. '}'
 end
 
 -- =============================================================================
@@ -191,7 +199,7 @@ requests = {}
 fake.sms_incoming("10086", "您的验证码 1234")
 fake.tick(20000)
 eq("pending: queued, not uploaded", #require("gw")._state().queue .. " " .. #find(UPLOAD_PATH), "1 0")
-eq("signed #status while pending", sms_reply(PHONE, signed("#status")), "2.0.0 csq=20 net=1 ip=10.0.0.2 q=1 gcm=ok fw=V2050 trust=pending ota=- boot=1")
+eq("signed #status while pending", sms_reply(PHONE, signed("#status")), "2.1.0 csq=20 net=1 ip=10.0.0.2 q=1 gcm=ok fw=V2050 trust=pending ota=- boot=1" .. winsuf())
 status = "trusted"
 next_poll(); fake.tick(100)
 eq("trusted: upload", #find(UPLOAD_PATH), 1)
@@ -208,7 +216,7 @@ eq("unsigned #reboot gets no reply", sms_reply(OTHER, "#reboot"), nil)
 fake.tick(100)
 eq("unsigned #reboot forwarded as a normal SMS", #find(UPLOAD_PATH), 1)
 ok("unsigned #reboot did not reboot", not fake.rebooted)
-eq("signed #status line", sms_reply(PHONE, signed("#status")), "2.0.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=0")
+eq("signed #status line", sms_reply(PHONE, signed("#status")), "2.1.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=0" .. winsuf())
 -- An unsigned " #ota clear" is forwarded VERBATIM (leading space and all), never quietly
 -- swallowed: the user has to be able to see a probe on the web page.
 requests = {}
@@ -223,7 +231,7 @@ print("== 1b. the signature gate: only a valid mac executes, everything else is 
 -- over "sms\n<body>" under SMS_KEY is the whole credential. A message that does not
 -- verify is forwarded like any other SMS and NEVER answered: no oracle, no SMS spend,
 -- and the probe shows up on the web page where the user can see it.
-local LINE0 = "2.0.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=0"
+local LINE0 = "2.1.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=0" .. winsuf()
 requests = {}
 eq("a valid mac executes", sms_reply(PHONE, signed("#status")), LINE0)
 fake.tick(20000)
@@ -403,7 +411,7 @@ eq("gw.lua did not arm a second watchdog", _G.WDT_INIT_CALLS, 1)
 wdt.init = real_wdt_init
 ok("OTA gw registers + polls", #find("/api/register") == 1 and polls() >= 1)
 eq("register reports ota=gw, boot=1", gcm.open(key1raw, find("/api/register")[1].body), reg_json("SIM 1 · 中国电信", "", "gw", 1))
-eq("signed #status shows ota=gw", sms_reply(PHONE, signed("#status")), "2.0.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=gw boot=1")
+eq("signed #status shows ota=gw", sms_reply(PHONE, signed("#status")), "2.1.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=gw boot=1" .. winsuf())
 -- Broken copies (power loss mid-write) are removed at boot instead of lingering
 -- behind a misleading ota=gw. (5 min of answered polls between boots, so the
 -- boot-loop guard stays out of the picture.)
@@ -415,14 +423,14 @@ ok("truncated copy: removal logged", log_has("ota gw unusable, removed"))
 eq("truncated copy removed", ota_file("gw"), nil)
 eq("flashed gw runs", _G.GW_TAG, nil)
 ok("flashed gw polls", polls() >= 1)
-eq("signed #status no longer claims ota=gw", sms_reply(PHONE, signed("#status")), "2.0.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=1")
+eq("signed #status no longer claims ota=gw", sms_reply(PHONE, signed("#status")), "2.1.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=1" .. winsuf())
 fake.tick(310000)
 write_file(fake.fs_root .. "/ota_gcm.lua", "local x = 1\n")   -- compiles, returns nothing
 boot()
 fake.tick(10)
 ok("copy returning no module: removal logged", log_has("ota gcm unusable, removed"))
 eq("it is removed", ota_file("gcm"), nil)
-eq("flashed gcm in use", sms_reply(PHONE, signed("#status")), "2.0.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=1")
+eq("flashed gcm in use", sms_reply(PHONE, signed("#status")), "2.1.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=1" .. winsuf())
 
 -- =============================================================================
 print("== 3b. the same commands over signed SMS, in normal mode")
@@ -578,24 +586,24 @@ ok("third silent boot: reverted", log_has("ota reverted") and ota_file("gw") == 
 fake.tick(10)
 ok("flashed gw back and polling", polls() >= 1 and _G.GW_TAG == nil)
 -- Flashed code, network down: main.lua must not reboot-loop a healthy device, and
--- gw.lua's own 20-failed-polls reboot must not be counted as a FAILED boot either —
+-- gw.lua's own poll-failure reboot must not be counted as a FAILED boot either —
 -- three of those in a row would drop a healthy module into rescue mode, where every
 -- inbound SMS is dropped on the floor.
 fake.tick(310000)
 offline = true
 boot()
-fake.tick(9 * 60000)   -- gw.lua's own 20-failed-polls reboot comes at ~10 min
-ok("real gw offline 9 min: not rebooted", not fake.rebooted)
+fake.tick(3 * 60000)   -- gw.lua reboots only after POLL_FAIL_MS of accumulated failure
+ok("real gw offline 3 min: not rebooted", not fake.rebooted)
 eq("offline: boot_fail stays 1 (never alive)", fskv.get("boot_fail"), 1)
-fake.tick(3 * 60000)
-ok("offline: gw.lua reboots after 20 failed polls", fake.rebooted)
-ok("offline: poll-failure reboot logged", log_has("times in a row; rebooting"))
+fake.tick(5 * 60000)
+ok("offline: gw.lua reboots after POLL_FAIL_MS of failing polls", fake.rebooted)
+ok("offline: poll-failure reboot logged", log_has("min; rebooting"))
 eq("flashed gw: that reboot is NOT a failed boot", fskv.get("boot_fail"), 0)
 fake.log_lines = {}
 for cycle = 1, 4 do
   boot()
   fake.sms_incoming("10086", "offline " .. cycle)
-  fake.tick(12 * 60000)
+  fake.tick(9 * 60000)
   ok("offline cycle " .. cycle .. ": rebooted by gw.lua", fake.rebooted)
   eq("offline cycle " .. cycle .. ": counter cleared again", fskv.get("boot_fail"), 0)
   ok("offline cycle " .. cycle .. ": never enters rescue", not log_has("RESCUE MODE"))
@@ -650,14 +658,16 @@ eq("rescue: registered once", #find("/api/register"), 1)
 eq("rescue: register bearer", find("/api/register")[1].headers["Authorization"], "Bearer " .. secret)
 eq("rescue: register blob shows boot=3, ota=-", gcm.open(key1raw, find("/api/register")[1].body), reg_json("SIM 1", "", "-", 3))
 eq("rescue: first poll", polls(), 1)
-fake.tick(120000)
-eq("rescue: polls every 60 s", polls(), 3)
+-- Two fetches per rescue cycle, by design: the health timer reboots out of rescue at
+-- ALIVE_OK_MS (5 min) once a poll has answered, so t=0 and t=240 s are all you get.
+fake.tick(245000)   -- t≈280 s: the 240 s poll lands, still inside ALIVE_OK_MS (300 s)
+eq("rescue: two polls per cycle at RESCUE_POLL_MS", polls(), 2)
 eq("rescue: no uploads, no outbox", #find(UPLOAD_PATH) + #find("/api/outbox"), 0)
 fake.sms_incoming(OTHER, "#status")
 fake.sms_incoming("10086", "ignored in rescue")
 fake.tick(100)
 eq("rescue: an unsigned #status is neither answered nor forwarded", #fake.sms_sent .. " " .. #find(UPLOAD_PATH), "0 0")
-eq("rescue: a signed #status falls back to main.lua's own line", sms_reply(PHONE, signed("#status")), "RESCUE boot_fail=3 ota=- fw=V2050 ver=2.0.0 dev=" .. dev())
+eq("rescue: a signed #status falls back to main.lua's own line", sms_reply(PHONE, signed("#status")), "RESCUE boot_fail=3 ota=- fw=V2050 ver=2.1.0 dev=" .. dev())
 fake.tick(150000)   -- 5 min up, polls answered → retry a normal boot
 ok("rescue: retries a normal boot after 5 min with answered polls", fake.rebooted)
 ok("rescue: retry logged", log_has("rescue: retrying a normal boot"))
@@ -688,8 +698,8 @@ fake.fs_clear()
 crash_boots(2)
 status = "pending"
 boot()
-fake.tick(35000 + 120000)
-ok("rescue while pending: polls answered, nothing run", polls() >= 3 and #find("/api/cmd/ack") == 0)
+fake.tick(35000 + 270000)
+ok("rescue while pending: polls answered, nothing run", polls() >= 2 and #find("/api/cmd/ack") == 0)
 -- Rescue with no network: retry after 15 min regardless.
 offline = true
 fake.sms_sent = {}
@@ -717,7 +727,7 @@ fake.tick(35000)
 ok("rescue: poll error logged", log_has("rescue: poll error"))
 _G.gw_alive = real_alive
 requests = {}
-fake.tick(60000)
+fake.tick(240000)
 ok("rescue: loop survived the error and polled again", polls() >= 1)
 -- Signed SMS in rescue: #url (bases via cmd_exec), #ota clear, #ota gw <hmac> from the Worker.
 eq("rescue: #url stores the bases", sms_reply(PHONE, signed("#url https://c.test")), "url ok rebooting")
@@ -768,7 +778,7 @@ do -- crypto.trng returns NOTHING on failure; indexing it would throw before sys
   fake.tick(60000)
   eq("no identity → nothing on the network", #requests, 0)
   ok("gw says so instead of crashing", log_has("no device identity"))
-  ok("main.lua still up: a signed #status is answered", (sms_reply(PHONE, signed("#status")) or ""):match("^2%.0%.0 csq=") ~= nil)
+  ok("main.lua still up: a signed #status is answered", (sms_reply(PHONE, signed("#status")) or ""):match("^2%.1%.0 csq=") ~= nil)
   crypto.trng = real_trng
 end
 do -- fskv cannot keep the identity (worn flash): main.lua hands it over in RAM
@@ -800,7 +810,7 @@ do -- boot counter that can be neither written nor erased: rescue must not loop
   ok("rescue: no reboot when the counter cannot be cleared", not fake.rebooted)
   ok("rescue: the stuck counter is logged", log_has("cannot clear boot_fail"))
   requests = {}
-  fake.tick(15 * 60000)
+  fake.tick(45 * 60000)
   ok("rescue: still no reboot loop", not fake.rebooted)
   ok("rescue: still reachable (polls keep going)", polls() >= 10)
   fskv.set, fskv.del = real_set, real_del
@@ -1041,6 +1051,68 @@ do
   boot(); fake.tick(2000)
   eq("8h a normal first unconfirmed boot counts, does not drop", fskv.get("bases_try"), 1)
   eq("8h override still there on boot 1", fskv.get("bases"), KEEP)
+end
+
+-- =============================================================================
+print("== 10. the frozen layer: what can never be changed after this flash")
+
+-- A signed command main.lua does not recognise must be FORWARDED, not swallowed. main.lua owns
+-- the SMS callback for good, so anything it claims here can never reach an OTA gw.lua — and this
+-- file can never be updated. Swallowing would freeze the signed-SMS surface for the life of the
+-- board, and that surface is the only channel left when the network path is broken.
+do
+  offline, status = false, "trusted"
+  fskv.clear(); fake.fs_clear()
+  boot()
+  fake.tick(35000)
+  requests = {}; fake.sms_sent = {}
+  fake.sms_incoming(PHONE, signed("#frobnicate"))
+  fake.tick(20000)
+  eq("an unknown signed command is forwarded, not swallowed", #find(UPLOAD_PATH), 1)
+  eq("and it is not answered (no oracle, no SMS spend)", #fake.sms_sent, 0)
+  ok("and it is logged as unknown", log_has("unknown sms command"))
+end
+
+-- Rescue must still register when gcm.lua is missing. Sharing one pcall between load_module("gcm")
+-- and the POST is what made a board flashed without gcm.lua invisible forever: no devices row, so
+-- /api/poll and /api/ota/get both 403 and nothing — not even a signed #ota — can reach it.
+do
+  local real_gcm = package.loaded["gcm"]
+  package.loaded["gcm"] = nil
+  package.preload["gcm"] = function() error("module 'gcm' not found (test)") end
+  offline, status = false, "pending"
+  fskv.clear(); fake.fs_clear()
+  fake.log_lines = {}
+  crash_boots(2)
+  boot()
+  fake.tick(35000)
+  local reg = find("/api/register")
+  eq("rescue registers even with gcm missing", #reg, 1)
+  eq("and the body is empty rather than plaintext", reg[1] and reg[1].body, "")
+  ok("and it says why", log_has("rescue: seal unavailable"))
+  ok("rescue keeps polling afterwards", polls() >= 1)
+  package.preload["gcm"] = nil
+  package.loaded["gcm"] = real_gcm
+end
+
+-- The shipped DEFAULTS.POLL_MS. Everything above pins it to 30 s so the fake's clock does not
+-- have to step through hours; this is the only place the real value is exercised. At 30 s the
+-- module spends ~440 MB/month and strands itself on a 200 MB SIM around day 13 — with no data
+-- left to OTA a fix.
+do
+  fake.config = { SMS_KEY = KEY1 }
+  offline, status = false, "trusted"
+  fskv.clear(); fake.fs_clear()
+  boot()
+  fake.tick(35000)
+  ok("shipped default: the first poll is prompt (ALIVE_MAX_MS gate)", polls() >= 1)
+  -- Count over a long window rather than bracketing one gap: phase-insensitive, and the two
+  -- candidates are far apart — 5 polls at 120 s, 20 at the old 30 s.
+  requests = {}
+  fake.tick(600000)
+  local n = polls()
+  ok("shipped default: POLL_MS is 120000, not 30000 (" .. n .. " polls in 10 min)", n >= 4 and n <= 6)
+  fake.config = CONFIG
 end
 
 fake.fs_destroy()

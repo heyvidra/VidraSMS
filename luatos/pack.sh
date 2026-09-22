@@ -32,6 +32,18 @@ for f in main.lua gw.lua gcm.lua config.lua; do
     exit 2
   }
 done
+# The scanner is also what makes Luatools DEMAND a file. main.lua loads gw and gcm through an
+# alias the scanner cannot read, so without an explicit mention it happily flashes a package with
+# both files missing -- which is exactly how one board shipped boot-looping on "module 'gw' not
+# found". Keep the inert mentions alive.
+for m in gw gcm; do
+  grep -qE "require\\(\"$m\"\\)" "$HERE/main.lua" || {
+    echo "main.lua no longer mentions require(\"$m\") on any line." >&2
+    echo "  Luatools would then flash a package WITHOUT $m.lua and the module would boot-loop." >&2
+    exit 2
+  }
+done
+
 VER="$(sed -nE 's/^VERSION[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$HERE/main.lua" | head -1)"
 [ -n "$VER" ] || { echo "cannot read VERSION from main.lua" >&2; exit 2; }
 
@@ -46,5 +58,8 @@ cat <<'TXT'
 ———— 粘贴给卖家 ————
 麻烦用 Luatools 刷一下：新建项目 → 底层选 LuatOS-SoC_V2050_Air780EHV_108.soc（我自己提供）→
 添加 zip 里的 4 个脚本（main.lua、gw.lua、gcm.lua、config.lua）→ 勾选「添加默认lib」→
-点「下载底层和脚本」→ 下载完在日志里看到 smsgw 字样即可。刷完插卡通电即可，不用配置。
+点「下载底层和脚本」→ 下载完在日志里看到 smsgw 字样即可。
+
+⚠️ 四个脚本必须全部添加，缺一个都会刷出一块开不了机的板子（工具不一定会提示）。
+⚠️ 核心板通电不会自动开机：拨到 ON 之后要按住「开机」键 2 秒。
 TXT

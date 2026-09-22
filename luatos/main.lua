@@ -10,18 +10,23 @@
 -- authenticated with that same key — there is no phone number to configure.
 -- Needs nothing from gw.lua/gcm.lua at load time.
 PROJECT = "smsgw"
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 sys = require("sys")
 require("sysplus")
 
 local DEFAULTS = { BASES = "https://777310753.xyz,https://20150411.xyz",
-                   TOPIC = "sms-7f3a9c2b1e0d", NAME = "Air780EHV", POLL_MS = 30000 }
+                   TOPIC = "sms-7f3a9c2b1e0d", NAME = "Air780EHV", POLL_MS = 120000 }
 local OTA_NAMES = { "gw", "gcm" }
 local OTA_USAGE = "usage: #ota clear | #ota gw|gcm <hmac-sha256 hex>"
 local HEALTH_TICK = 30000      -- one loop timer sequences the health rule and the rescue retry
 local ALIVE_OK_MS = 300000     -- 5 min up AND the Worker answered a poll = healthy boot
 local ALIVE_MAX_MS = 900000    -- 15 min without an answer: OTA code presumed broken / rescue retries anyway
-local RESCUE_POLL_MS = 60000
+-- Rescue is the one loop an OTA can never reach (this file returns before gw.lua is loaded),
+-- so this number is frozen for the life of the board. At 60 s a board that falls into rescue
+-- spends ~230 MB/month polling and eats a 200 MB SIM inside one month — turning "reachable and
+-- fixable" into "unreachable". 240 s still gives two command fetches per ~6.5 min rescue cycle
+-- (ALIVE_OK_MS reboots it at 5 min), and the instant channel is a signed SMS, not this loop.
+local RESCUE_POLL_MS = 240000
 
 local function kv_get(k) local ok, v = pcall(fskv.get, k); if ok then return v end; return nil end
 local function kv_set(k, v) local ok, r = pcall(fskv.set, k, v); return ok and r end
@@ -192,6 +197,12 @@ local function ota_remove() for _, n in ipairs(OTA_NAMES) do pcall(os.remove, ot
 -- obvious way, the dynamic call below made it demand a "name.lua" that cannot exist and refuse to
 -- flash with 缺少库文件. Through an alias it is the identical call with nothing to misread — which
 -- is also why no comment in this file spells that call out literally.
+-- ...but invisible also means Luatools will happily flash a package with gw.lua and gcm.lua
+-- MISSING: it only ever demanded config.lua, so a flash that the tool called successful left the
+-- module boot-looping on "module 'gw' not found" into rescue mode. These two lines never execute;
+-- they exist so the scanner sees both names and refuses to flash without them.
+if false then require("gw") end
+if false then require("gcm") end
 local luaRequire = require
 function _G.load_module(name)
   local src = ota_read(name)
@@ -500,7 +511,7 @@ local function sms_cmd(num, txt)
     return false
   end
   local cmd, rest = body:match("^#(%a+)%s*(.-)%s*$")
-  if not cmd then log.warn("main", "signed but unparsable command", body); return true end
+  if not cmd then log.warn("main", "signed but unparsable command", body, "- forwarding it"); return false end
   cmd = cmd:lower()
   log.info("main", "sms cmd", cmd, rest)
   if cmd == "status" then
@@ -518,7 +529,13 @@ local function sms_cmd(num, txt)
     local name, hmac_hex = rest:match("^(%S+)%s+(%S+)$")
     if name then _G.gw_ota.install(name, hmac_hex, num) else reply(num, OTA_USAGE) end
   else
-    log.warn("main", "unknown sms command", cmd)
+    -- Not one of ours: hand it on rather than swallow it. main.lua owns the SMS callback for
+    -- good, so a command claimed here can NEVER reach an OTA gw.lua — and this file can never
+    -- be updated. Returning false is the only thing that leaves room for a future gw.lua to add
+    -- signed commands of its own (it verifies the same way: sms_split + HMAC over "sms\\n"..body,
+    -- first 16 hex, case-insensitive). Without this, the signed-SMS surface is frozen forever.
+    log.warn("main", "unknown sms command", cmd, "- forwarding it")
+    return false
   end
   return true
 end
@@ -591,11 +608,25 @@ if boot_fail >= 3 then
   end
   sys.taskInit(function()
     sys.waitUntil("IP_READY", 30000)
-    local ok, err = pcall(function()
+    -- The seal gets its OWN pcall. Sharing one with the POST is exactly how a board flashed
+    -- without gcm.lua went invisible for good: load_module("gcm") threw, so the register was
+    -- never sent, and rescue registers only once per session. No devices row means /api/poll
+    -- and /api/ota/get both answer 403 — the web shows nothing, no command can be queued, and
+    -- even a signed "#ota" cannot help, because the download needs that same row. An empty body
+    -- still creates the pending row (the Worker stores info as NULL), which is all the web needs
+    -- to show a card and let the owner push an OTA. Never fall back to an UNSEALED gw_reg: that
+    -- would put IMEI/ICCID/IMSI on the wire in clear, with certificate verification off.
+    local body = ""
+    local sok, v1 = pcall(function()
       local gcm = _G.load_module("gcm")
+      return gcm.seal(key32_of(merged()), _G.gw_reg("SIM 1", ""))
+    end)
+    if sok and type(v1) == "string" and #v1 > 0 then body = v1
+    else log.error("main", "rescue: seal unavailable — registering with an empty body", v1) end
+    local ok, err = pcall(function()
       local code = first_2xx("POST", "/api/register?dev=" .. dev_id, "text/plain; charset=utf-8",
-        gcm.seal(key32_of(merged()), _G.gw_reg("SIM 1", "")), 15000)
-      log.info("main", "rescue: register", code)
+        body, 15000)
+      log.info("main", "rescue: register", code, #body)
     end)
     if not ok then log.error("main", "rescue: register error", err) end
     while true do
