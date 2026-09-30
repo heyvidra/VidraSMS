@@ -7,6 +7,8 @@
 // Reading the messages is a normal cookie session: /login issues an HMAC-signed cookie,
 // every other read verifies it.
 
+import { DurableObject } from "cloudflare:workers";
+
 const PAGE_SIZE = 200;
 // How long a claimed-but-unacked outbox row may sit before another poll may take it again.
 // Longer than the 60s a send waits for its delivery report, plus room for a slow poll.
@@ -65,6 +67,83 @@ async function sessionValid(request, env) {
 }
 
 const COOKIE_FLAGS = `Path=/; HttpOnly; Secure; SameSite=Strict`;
+
+/* -------------------------------------------------------------- device auth */
+
+async function sha256hex(s) {
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+  return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Who is this device? Two credentials coexist on the same routes:
+//   - the phones' shared SEND_TOKEN → { dev, legacy: true }. dev may be empty (an old build that
+//     never sent ?dev=), exactly as before — nothing about the phone path changes here.
+//   - a module's own secret → { dev, status }. Modules are looked up by ?dev= and verified as
+//     sha256(bearer) against devices.auth, so a D1 dump never contains a credential that works.
+//   - anything else → null. Callers answer with whatever they answered before (403 / 401), so a
+//     phone with a wrong token sees byte-for-byte what it always saw.
+// The hash is compared with safeEqual like the token itself: not because a hash comparison leaks
+// much, but because one code path for both means one thing to get right.
+async function deviceAuth(request, env, url) {
+  const auth = request.headers.get("Authorization") || "";
+  if (!auth.startsWith("Bearer ")) return null;
+  const bearer = auth.slice(7);
+  const dev = (url.searchParams.get("dev") || "").slice(0, 64);
+  if (env.SEND_TOKEN && safeEqual(bearer, env.SEND_TOKEN)) return { dev, legacy: true };
+  if (!dev || !bearer) return null;
+  // The two columns arrive with setup.sh's ALTERs. If the code got deployed a step ahead of the
+  // migration, a module simply cannot authenticate yet — and a phone with a wrong token must see
+  // the 403/401 it always saw, not a 500 about a missing column.
+  let row;
+  try {
+    row = await env.DB.prepare("SELECT auth, status, ts FROM devices WHERE id = ?").bind(dev).first();
+  } catch { return null; }
+  if (!row || !row.auth) return null;
+  if (!safeEqual(await sha256hex(bearer), row.auth)) return null;
+  return { dev, status: row.status, ts: Number(row.ts) || 0 };
+}
+
+// A device that authenticated but may not act: a module the web has not trusted yet (or has
+// blocked). Phones are never gated — the legacy token predates the status column.
+const deviceAllowed = (a) => !!a && (a.legacy || a.status === "trusted");
+
+// How often an untrusted module's heartbeat is written. Its credential is self-issued, so anyone
+// holding a pending row could otherwise turn a request loop into a billable D1 write loop.
+const UNTRUSTED_BEAT_MS = 60_000;
+
+// The poll batch shared by the phones' /api/outbox and the modules' /api/poll. Four statements,
+// in this order, run atomically:
+//  1. stamp last-seen (the web reads it to know the device is alive; no dev → the pre-device-id
+//     single heartbeat, which the page still shows for old builds);
+//  2. fail out rows claimed MAX_CLAIMS times that never came back acked — the device plainly
+//     can't submit them (weak signal / lost acks) and they must not cycle forever;
+//  3. give back claims stuck past the timeout so the next poll retries them. The window is
+//     generous — a real send waits up to 60s for its delivery result — so a live device is never
+//     second-guessed;
+//  4. claim-on-read: flip pending → sending and RETURN those rows, so a lost ack after a real
+//     send can't get the SMS sent twice. A row addressed to a device is only ever claimed by that
+//     device; dev IS NULL means "any", which a single-phone setup keeps producing.
+// Returns the statements so a caller can append its own to the same batch.
+function pollStatements(env, dev, now) {
+  const stamp = dev
+    ? env.DB.prepare("INSERT INTO devices (id, ts) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET ts=excluded.ts").bind(dev, now)
+    : env.DB.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('beat', ?)").bind(String(now));
+  const failout = env.DB.prepare(
+    "UPDATE outbox SET status='failed', detail='多次尝试未送达（弱信号或网络问题）' " +
+    "WHERE status='sending' AND ts <= ? AND claims >= ?"
+  ).bind(now - CLAIM_TIMEOUT_MS, MAX_CLAIMS);
+  const stale = env.DB.prepare(
+    "UPDATE outbox SET status='pending' WHERE status='sending' AND ts <= ? AND claims < ?"
+  ).bind(now - CLAIM_TIMEOUT_MS, MAX_CLAIMS);
+  const claim = env.DB.prepare(
+    "UPDATE outbox SET status='sending', claims=claims+1 WHERE status='pending' AND (dev IS NULL OR dev = ?) RETURNING id, payload"
+  ).bind(dev);
+  return [stamp, failout, stale, claim];
+}
+
+const OTA_NAMES = new Set(["gw", "gcm"]);
+const CMD_TYPES = new Set(["reboot", "ota", "bases"]);
+const DEV_STATUSES = new Set(["pending", "trusted", "blocked"]);
 
 /* --------------------------------------------------------------- web push */
 
@@ -136,8 +215,10 @@ async function handlePublish(request, env, topic, ctx) {
   if (!env.SEND_TOKEN) return new Response("server not configured", { status: 500 });
   if (topic !== env.TOPIC) return new Response("unknown topic", { status: 404 });
 
-  const auth = request.headers.get("Authorization") || "";
-  if (!auth.startsWith("Bearer ") || !safeEqual(auth.slice(7), env.SEND_TOKEN)) {
+  // Phones (SEND_TOKEN) or a trusted module (its own secret). A module the web has not trusted
+  // gets the same 403 as a bad token: the device keeps the message queued and retries later.
+  const u = new URL(request.url);
+  if (!deviceAllowed(await deviceAuth(request, env, u))) {
     return new Response("forbidden", { status: 403 });
   }
 
@@ -147,7 +228,6 @@ async function handlePublish(request, env, topic, ctx) {
   // A backfill (the app re-forwarding the phone's existing inbox) arrives with quiet=1 and the
   // message's ORIGINAL time: stored like any other row, but no push — 50 old messages must not
   // become 50 notifications — and timestamped when it really arrived, not when it was re-sent.
-  const u = new URL(request.url);
   const quiet = u.searchParams.get("quiet") === "1";
   const tsParam = Number(u.searchParams.get("ts") || 0);
   const ts = (quiet && tsParam > 1e12 && tsParam <= Date.now() + 60_000) ? tsParam : Date.now();
@@ -244,7 +324,7 @@ async function handleLogin(request, env) {
 
 /* ------------------------------------------------------------------- router */
 
-export default {
+const app = {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
@@ -331,6 +411,7 @@ export default {
       const dev = typeof b.dev === "string" && b.dev ? b.dev.slice(0, 64) : null;
       const r = await env.DB.prepare("INSERT INTO outbox (ts, payload, status, dev) VALUES (?, ?, 'pending', ?)")
         .bind(Date.now(), b.payload, dev).run();
+      ctx.waitUntil(poke(env, dev));
       return Response.json({ ok: true, id: r.meta?.last_row_id });
     }
     // Web reads its own outbox to show status.
@@ -349,53 +430,20 @@ export default {
     //  2. claim-on-read: flip pending -> sending and RETURN those rows, so if the phone's ack is
     //     lost after a real send, the row is no longer 'pending' and won't be sent a second time.
     if (isRead && path === "/api/outbox") {
-      const auth = request.headers.get("Authorization") || "";
-      if (!env.SEND_TOKEN || !auth.startsWith("Bearer ") || !safeEqual(auth.slice(7), env.SEND_TOKEN)) {
-        return new Response("forbidden", { status: 403 });
-      }
+      const a = await deviceAuth(request, env, url);
+      if (!deviceAllowed(a)) return new Response("forbidden", { status: 403 });
       // ?dev= identifies which phone is polling. Everything is keyed on it now, because with two
       // phones sharing one token a single heartbeat hid which one had died, and a send meant for
       // one could be claimed and sent by the other, off the wrong SIM.
-      const dev = (url.searchParams.get("dev") || "").slice(0, 64);
-      const now = Date.now();
-      const stamp = dev
-        ? env.DB.prepare("INSERT INTO devices (id, ts) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET ts=excluded.ts").bind(dev, now)
-        : env.DB.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('beat', ?)").bind(String(now));
-      // A claim that is never acked used to be terminal: the phone dies (or the response never
-      // reaches it) right after the row flips to 'sending', and since nothing ever writes it back
-      // the SMS is silently never sent. Rows stuck 'sending' past the timeout are returned to
-      // 'pending' so the next poll picks them up. The window is generous — a real send waits up
-      // to 60s for its delivery result — so a live phone is never second-guessed.
-      // A claim stuck past the timeout: give it back to be retried — UNLESS it has already been
-      // claimed MAX_CLAIMS times without ever acking, in which case the phone plainly can't submit
-      // it (weak signal / lost acks) and it becomes 'failed' rather than cycling forever.
-      const failout = env.DB.prepare(
-        "UPDATE outbox SET status='failed', detail='多次尝试未送达（弱信号或网络问题）' " +
-        "WHERE status='sending' AND ts <= ? AND claims >= ?"
-      ).bind(now - CLAIM_TIMEOUT_MS, MAX_CLAIMS);
-      const stale = env.DB.prepare(
-        "UPDATE outbox SET status='pending' WHERE status='sending' AND ts <= ? AND claims < ?"
-      ).bind(now - CLAIM_TIMEOUT_MS, MAX_CLAIMS);
-      // A row addressed to a specific device is only ever claimed by that device; dev IS NULL
-      // means "any phone", which is what a single-phone setup keeps producing. Each claim bumps
-      // the counter that feeds the fail-out above.
-      const claimSql = "UPDATE outbox SET status='sending', claims=claims+1 WHERE status='pending' AND (dev IS NULL OR dev = ?) RETURNING id, payload";
-      const [, , , claim] = await env.DB.batch([
-        stamp,
-        failout,
-        stale,
-        env.DB.prepare(claimSql).bind(dev),
-      ]);
+      const [, , , claim] = await env.DB.batch(pollStatements(env, a.dev, Date.now()));
       return Response.json(claim.results || []);
     }
     // Phone reports its name + SIM list, encrypted: both are PII, so the server keeps it opaque
     // and only the browser can read it. Per device, so two phones stop overwriting each other.
     if (request.method === "POST" && path === "/api/devinfo") {
-      const auth = request.headers.get("Authorization") || "";
-      if (!env.SEND_TOKEN || !auth.startsWith("Bearer ") || !safeEqual(auth.slice(7), env.SEND_TOKEN)) {
-        return new Response("forbidden", { status: 403 });
-      }
-      const dev = (url.searchParams.get("dev") || "").slice(0, 64);
+      const a = await deviceAuth(request, env, url);
+      if (!deviceAllowed(a)) return new Response("forbidden", { status: 403 });
+      const dev = a.dev;
       if (!dev) return new Response('{"error":"bad"}', { status: 400 });
       const info = (await request.text()).slice(0, 4096);
       await env.DB.prepare(
@@ -403,12 +451,22 @@ export default {
       ).bind(dev, Date.now(), info).run();
       return Response.json({ ok: true });
     }
-    // Web polls this for the per-device liveness list.
+    // Web polls this for the per-device liveness list. `module` (has its own secret) is what lets
+    // the page offer 信任/拉黑 and commands only where they mean something — on a phone, status
+    // is ignored by the token path and a command would never be picked up.
     if (isRead && path === "/api/status") {
       if (!(await sessionValid(request, env))) {
         return new Response('{"error":"unauthorized"}', { status: 401, headers: { "Content-Type": "application/json" } });
       }
-      const { results } = await env.DB.prepare("SELECT id, ts, info FROM devices ORDER BY ts DESC").all();
+      let results;
+      try {
+        ({ results } = await env.DB.prepare(
+          "SELECT id, ts, info, status, (auth IS NOT NULL) AS module FROM devices ORDER BY ts DESC"
+        ).all());
+      } catch {
+        // Code deployed ahead of setup.sh's ALTERs: the phones' strip must not go blank for that.
+        ({ results } = await env.DB.prepare("SELECT id, ts, info FROM devices ORDER BY ts DESC").all());
+      }
       const legacy = await env.DB.prepare("SELECT v FROM meta WHERE k='beat'").first();
       return Response.json({ devices: results || [], beat: legacy ? Number(legacy.v) : 0 });
     }
@@ -425,16 +483,262 @@ export default {
     }
     // Phone reports the result of a send.
     if (request.method === "POST" && path === "/api/outbox/ack") {
-      const auth = request.headers.get("Authorization") || "";
-      if (!env.SEND_TOKEN || !auth.startsWith("Bearer ") || !safeEqual(auth.slice(7), env.SEND_TOKEN)) {
-        return new Response("forbidden", { status: 403 });
-      }
+      const a = await deviceAuth(request, env, url);
+      if (!deviceAllowed(a)) return new Response("forbidden", { status: 403 });
       const b = await request.json().catch(() => null);
       const id = Number(b?.id);
       if (!Number.isInteger(id)) return new Response('{"error":"bad"}', { status: 400 });
-      await env.DB.prepare("UPDATE outbox SET status=?, detail=? WHERE id=?")
-        .bind(b.ok ? "sent" : "failed", (b.detail || "").slice(0, 200), id).run();
+      const st = b.ok ? "sent" : "failed", detail = (b.detail || "").slice(0, 200);
+      // Phones share one token and are all the owner's, so their ack has never been scoped and
+      // stays that way. A module has an identity of its own: it may only close rows it could
+      // have claimed — its own or the unaddressed ones — never another device's.
+      const upd = a.legacy
+        ? env.DB.prepare("UPDATE outbox SET status=?, detail=? WHERE id=?").bind(st, detail, id)
+        : env.DB.prepare("UPDATE outbox SET status=?, detail=? WHERE id=? AND (dev IS NULL OR dev = ?)").bind(st, detail, id, a.dev);
+      await upd.run();
       return Response.json({ ok: true });
+    }
+
+    // --- self-registering modules (Air780EHV) ------------------------------------------
+    // A module has no operator to type a token into it. At first boot it makes its own secret,
+    // registers here with everything it knows about itself (encrypted, like devinfo), and shows
+    // up on the web as 待信任. Until someone clicks 信任 it can neither publish nor claim sends;
+    // it just keeps re-registering and polling, so the answer to "is it trusted yet" is always
+    // one poll away. No TOFU, no shared token: the phone's SEND_TOKEN is never on a module.
+    if (request.method === "POST" && path === "/api/register") {
+      const auth = request.headers.get("Authorization") || "";
+      if (!auth.startsWith("Bearer ") || auth.length <= 7) return new Response("forbidden", { status: 403 });
+      const dev = url.searchParams.get("dev") || "";
+      if (!/^[0-9a-f]{16,64}$/.test(dev)) return new Response('{"error":"bad"}', { status: 400 });
+      // The secret is the module's only credential for everything it will ever do here, so a weak
+      // one (a buggy or copycat firmware registering with "a") must not become permanent. Part B
+      // mints 32 hex from the TRNG; anything else is a client bug, not an auth failure.
+      if (!/^[0-9a-f]{32,128}$/i.test(auth.slice(7))) return new Response('{"error":"bad"}', { status: 400 });
+      // The blob is a few hundred bytes of ciphertext and a truncated one decrypts to nothing, so
+      // an oversized body is refused — before it is read, like every other refusal below: nothing
+      // here buffers a body for a request that is about to be turned away.
+      if (Number(request.headers.get("Content-Length") || 0) > 4096) return new Response('{"error":"too large"}', { status: 413 });
+      const h = await sha256hex(auth.slice(7));
+      const now = Date.now();
+      const readInfo = async () => (await request.text()).slice(0, 4096) || null;
+      const row = await env.DB.prepare("SELECT auth, status, ts FROM devices WHERE id = ?").bind(dev).first();
+      if (!row) {
+        // Anyone who knows the URL can register (that is the point — nothing to configure), so
+        // cap the unreviewed pile: past this a stranger's spam just gets 429 until the web tidies.
+        const c = await env.DB.prepare("SELECT count(*) AS n FROM devices WHERE status='pending'").first();
+        if ((c?.n || 0) >= 20) return new Response("too many pending devices", { status: 429 });
+        await env.DB.prepare("INSERT INTO devices (id, ts, info, auth, status) VALUES (?, ?, ?, ?, 'pending')")
+          .bind(dev, now, await readInfo(), h).run();
+        return Response.json({ status: "pending" });
+      }
+      // A phone's id (no secret) can't be taken over by a module claiming the same id.
+      if (!row.auth) return new Response('{"error":"conflict"}', { status: 409 });
+      if (!safeEqual(h, row.auth)) return new Response("forbidden", { status: 403 });
+      // Re-registration (every boot and every 30 min): refresh the self-description, and count it
+      // as a heartbeat. Status is the web's to set, never the device's. A blocked module gets its
+      // answer and nothing else; a pending one is written at most once a minute — both hold a
+      // credential nobody has vetted, and neither may drive D1 writes at will.
+      if (row.status === "blocked") return Response.json({ status: "blocked" });
+      if (row.status === "trusted" || now - (Number(row.ts) || 0) >= UNTRUSTED_BEAT_MS) {
+        await env.DB.prepare("UPDATE devices SET info=?, ts=? WHERE id=?").bind(await readInfo(), now, dev).run();
+      }
+      return Response.json({ status: row.status });
+    }
+    // The module's poll: /api/outbox plus the command channel, in one round trip. GET only —
+    // a HEAD would claim rows and drop them. The legacy token is refused on purpose: phones
+    // have /api/outbox, and a token that is on every phone must not be able to pick up commands
+    // meant for a specific module.
+    if (request.method === "GET" && path === "/api/poll") {
+      const a = await deviceAuth(request, env, url);
+      if (!a || a.legacy) return new Response("forbidden", { status: 403 });
+      const now = Date.now();
+      if (a.status !== "trusted") {
+        // Still a heartbeat — the web shows "last seen" on a pending card so you can tell the
+        // module you just powered on from one that registered last week — but no claim, no cmd,
+        // at most one write a minute (the credential is self-issued), and none once blocked.
+        if (a.status === "pending" && now - a.ts >= UNTRUSTED_BEAT_MS) {
+          await env.DB.prepare("UPDATE devices SET ts=? WHERE id=?").bind(now, a.dev).run();
+        }
+        return Response.json({ status: a.status });
+      }
+      const cmdSel = env.DB.prepare(
+        "SELECT id, payload FROM cmds WHERE dev=? AND status='pending' ORDER BY id LIMIT 1"
+      ).bind(a.dev);
+      const [, , , claim, cmds] = await env.DB.batch([...pollStatements(env, a.dev, now), cmdSel]);
+      let cmd = null;
+      const c = cmds.results?.[0];
+      if (c) { try { cmd = Object.assign({ id: c.id }, JSON.parse(c.payload)); } catch {} }
+      return Response.json({ status: "trusted", rows: claim.results || [], cmd });
+    }
+    // The module's socket (see class Hub). Same credential as the poll. A pending module may hold
+    // one too, so clicking 信任 pokes it and it starts working at once. Blocked: refused, and the
+    // module backs off to HTTPS-only.
+    if (request.method === "GET" && path === "/api/ws") {
+      const a = await deviceAuth(request, env, url);
+      if (!a || a.legacy || a.status === "blocked") return new Response("forbidden", { status: 403 });
+      if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket" || !env.HUB) {
+        return new Response("upgrade required", { status: 426 });
+      }
+      return env.HUB.get(env.HUB.idFromName("hub")).fetch(new Request("https://hub/ws?dev=" + encodeURIComponent(a.dev), request));
+    }
+    // Module reports how a command went. Scoped to its own dev so one module can't close
+    // another's command.
+    if (request.method === "POST" && path === "/api/cmd/ack") {
+      const a = await deviceAuth(request, env, url);
+      if (!a || a.legacy || a.status !== "trusted") return new Response("forbidden", { status: 403 });
+      const b = await request.json().catch(() => null);
+      const id = Number(b?.id);
+      if (!Number.isInteger(id)) return new Response('{"error":"bad"}', { status: 400 });
+      await env.DB.prepare("UPDATE cmds SET status=?, detail=? WHERE id=? AND dev=?")
+        .bind(b.ok ? "done" : "failed", String(b.detail || "").slice(0, 200), id, a.dev).run();
+      return Response.json({ ok: true });
+    }
+    // The script an OTA command points at. Plain bytes, no signature here: the module checks
+    // HMAC-SHA256 under SMS_KEY against cmd.hmac, which the browser computed — the server never
+    // had the key and so can never hand a module code the owner did not sign.
+    if (request.method === "GET" && path === "/api/ota/get") {
+      const a = await deviceAuth(request, env, url);
+      if (!a || a.legacy || a.status !== "trusted") return new Response("forbidden", { status: 403 });
+      const name = url.searchParams.get("name") || "";
+      if (!OTA_NAMES.has(name)) return new Response('{"error":"bad"}', { status: 400 });
+      const bytes = await env.APK?.get("ota:" + name, "arrayBuffer");
+      if (!bytes) return new Response("not found", { status: 404 });
+      return new Response(bytes, {
+        headers: {
+          "Content-Type": "text/plain; charset=utf-8",
+          "Content-Length": String(bytes.byteLength),
+          "Cache-Control": "no-cache",
+        },
+      });
+    }
+
+    // --- web side of the module registry (cookie session) -------------------------------
+    if (request.method === "POST" && path === "/api/device/trust") {
+      if (!(await sessionValid(request, env))) {
+        return new Response('{"error":"unauthorized"}', { status: 401, headers: { "Content-Type": "application/json" } });
+      }
+      const b = await request.json().catch(() => null);
+      if (!b?.id || !DEV_STATUSES.has(b.status)) return new Response('{"error":"bad"}', { status: 400 });
+      await env.DB.prepare("UPDATE devices SET status=? WHERE id=?").bind(b.status, String(b.id).slice(0, 64)).run();
+      ctx.waitUntil(poke(env, String(b.id).slice(0, 64)));   // a socket-holding module hears 信任/拉黑 now
+      return Response.json({ ok: true });
+    }
+    // Queue a command for a module. One pending per device: a module runs a command and reboots,
+    // so a second one queued behind it would run against a state nobody looked at.
+    if (request.method === "POST" && path === "/api/cmd") {
+      if (!(await sessionValid(request, env))) {
+        return new Response('{"error":"unauthorized"}', { status: 401, headers: { "Content-Type": "application/json" } });
+      }
+      const b = await request.json().catch(() => null);
+      const dev = typeof b?.dev === "string" ? b.dev.slice(0, 64) : "";
+      if (!dev || !CMD_TYPES.has(b.type)) return new Response('{"error":"bad"}', { status: 400 });
+      const payload = { type: b.type };
+      if (b.type === "ota") {
+        if (!OTA_NAMES.has(b.name) || !/^[0-9a-f]{64}$/i.test(String(b.hmac || ""))) {
+          return new Response('{"error":"bad"}', { status: 400 });
+        }
+        payload.name = b.name; payload.hmac = String(b.hmac).toLowerCase();
+      } else if (b.type === "bases") {
+        // The module will only ever talk to these, so a typo here bricks it until an SMS command
+        // (if OWNER is set) or a reflash — validate hard. The normalised list is what gets stored.
+        // The module appends "/api/…" to each entry, so nothing that would swallow that — a query,
+        // a fragment, quotes, escapes — may ride along, and a trailing "/" is dropped so the join
+        // is well-formed. The page's 改域名 prompt applies the same rule before asking.
+        //
+        // Signed like "ota", and for a stronger reason: `bases` moves the module to another
+        // server for good, so an unsigned one lets an on-path attacker (TLS verification is off
+        // by default) or a compromised Worker capture it permanently — block/forget would never
+        // reach it again. The browser MACs "bases\n" + the normalised value under SMS_KEY, which
+        // this server never holds: it can neither verify the signature nor forge one. It only
+        // insists one is present and carries it to the module, which checks it against the value
+        // exactly as stored. The normalisation below is the same rule the page already applied,
+        // so on a page-sent value it is a no-op and what is stored is what was signed.
+        if (!/^[0-9a-f]{64}$/i.test(String(b.hmac || ""))) {
+          return new Response('{"error":"bad"}', { status: 400 });
+        }
+        const list = String(b.value || "").split(",").map((s) => s.trim().replace(/\/+$/, "")).filter(Boolean);
+        const okUrl = (s) => s.length <= 120 && /^https:\/\/[A-Za-z0-9.-]+(:[0-9]+)?(\/[A-Za-z0-9._~\/-]*)?$/.test(s);
+        if (!list.length || list.length > 5 || !list.every(okUrl)) {
+          return new Response('{"error":"bad"}', { status: 400 });
+        }
+        payload.value = list.join(",");
+        payload.hmac = String(b.hmac).toLowerCase();
+      }
+      // Only a module can pick a command up; refusing for phones keeps a stray click from parking
+      // a row that would show "待执行" forever.
+      const row = await env.DB.prepare("SELECT auth FROM devices WHERE id = ?").bind(dev).first();
+      if (!row?.auth) return new Response('{"error":"nodev"}', { status: 404 });
+      const pend = await env.DB.prepare("SELECT id FROM cmds WHERE dev=? AND status='pending' LIMIT 1").bind(dev).first();
+      if (pend) return new Response('{"error":"pending"}', { status: 409, headers: { "Content-Type": "application/json" } });
+      const r = await env.DB.prepare("INSERT INTO cmds (ts, dev, payload) VALUES (?, ?, ?)")
+        .bind(Date.now(), dev, JSON.stringify(payload)).run();
+      ctx.waitUntil(poke(env, dev));
+      return Response.json({ ok: true, id: r.meta?.last_row_id });
+    }
+    if (isRead && path === "/api/cmd/list") {
+      if (!(await sessionValid(request, env))) {
+        return new Response('{"error":"unauthorized"}', { status: 401, headers: { "Content-Type": "application/json" } });
+      }
+      const dev = (url.searchParams.get("dev") || "").slice(0, 64);
+      const { results } = await env.DB.prepare(
+        "SELECT id, ts, payload, status, detail FROM cmds WHERE dev=? ORDER BY id DESC LIMIT 20"
+      ).bind(dev).all();
+      return Response.json(results || []);
+    }
+    // Withdraw a command the module has not picked up yet. A done/failed row is history and stays.
+    if (request.method === "DELETE" && path.startsWith("/api/cmd/")) {
+      if (!(await sessionValid(request, env))) {
+        return new Response('{"error":"unauthorized"}', { status: 401, headers: { "Content-Type": "application/json" } });
+      }
+      const id = Number(path.slice("/api/cmd/".length));   // an integer: nothing to decode, and "%" must not throw
+      if (!Number.isInteger(id)) return new Response('{"error":"bad"}', { status: 400 });
+      const r = await env.DB.prepare("DELETE FROM cmds WHERE id=? AND status='pending'").bind(id).run();
+      return Response.json({ ok: true, deleted: r.meta?.changes || 0 });
+    }
+    // Stage a script for OTA. Stored as-is in KV; the signature travels in the cmd, not here,
+    // because it is made in the browser with the key the server never holds. The Lua sniff is
+    // only there to catch uploading the wrong file (a .soc, a zip) — it is not a security check.
+    if (request.method === "POST" && path === "/api/ota/put") {
+      if (!(await sessionValid(request, env))) {
+        return new Response('{"error":"unauthorized"}', { status: 401, headers: { "Content-Type": "application/json" } });
+      }
+      const name = url.searchParams.get("name") || "";
+      if (!OTA_NAMES.has(name)) return new Response('{"error":"bad"}', { status: 400 });
+      // The file's own HMAC, computed in the browser under SMS_KEY — the same value the "ota"
+      // command carries. Optional, and never trusted here (the server has no key to check it
+      // with): it is kept beside the file only so the 短信指令 composer can offer "用上次上传的"
+      // without the file in hand, because an SMS "#ota gw <hmac>" is nothing but that hmac. A
+      // malformed one is refused rather than stored — a stored lie would be copied straight into
+      // a command the module then rejects, with nothing on screen to say why.
+      const hmacQ = url.searchParams.get("hmac");
+      if (hmacQ !== null && !/^[0-9a-f]{64}$/i.test(hmacQ)) return new Response('{"error":"bad hmac"}', { status: 400 });
+      if (Number(request.headers.get("Content-Length") || 0) > 200_000) return new Response('{"error":"too large"}', { status: 413 });
+      const bytes = await request.arrayBuffer();
+      if (bytes.byteLength > 200_000) return new Response('{"error":"too large"}', { status: 413 });
+      const text = new TextDecoder().decode(bytes);
+      const looksLua = text.includes("return M") || /^\s*(--|local\b)/.test(text);
+      if (!bytes.byteLength || !looksLua) return new Response('{"error":"not lua"}', { status: 400 });
+      const sha256 = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))]
+        .map((b) => b.toString(16).padStart(2, "0")).join("");
+      const meta = { size: bytes.byteLength, ts: Date.now(), sha256 };
+      if (hmacQ) meta.hmac = hmacQ.toLowerCase();
+      await env.APK.put("ota:" + name, bytes);
+      await env.APK.put("ota:" + name + ":meta", JSON.stringify(meta));
+      return Response.json({ ok: true, size: meta.size, sha256 });
+    }
+    if (isRead && path === "/api/ota/meta") {
+      if (!(await sessionValid(request, env))) {
+        return new Response('{"error":"unauthorized"}', { status: 401, headers: { "Content-Type": "application/json" } });
+      }
+      // The stored meta verbatim — size/ts/sha256, plus `hmac` when the upload carried one.
+      // An entry written before that param existed simply has no `hmac`, and the page's
+      // 「用上次上传的」shortcut stays hidden for it.
+      const out = {};
+      for (const n of OTA_NAMES) {
+        const m = await env.APK?.get("ota:" + n + ":meta");
+        out[n] = m ? JSON.parse(m) : null;
+      }
+      return Response.json(out);
     }
 
 
@@ -488,10 +792,11 @@ export default {
     //   GET /api/app?meta=1 -> {"code":<versionCode>,"name":"<versionName>"} (set by upload-apk.sh)
     //   GET /api/app        -> the APK bytes
     if (path === "/api/app") {
-      const auth = request.headers.get("Authorization") || "";
-      if (!env.SEND_TOKEN || !auth.startsWith("Bearer ") || !safeEqual(auth.slice(7), env.SEND_TOKEN)) {
+      const a = await deviceAuth(request, env, url);
+      if (!a) {
         return new Response('{"error":"unauthorized"}', { status: 401, headers: { "Content-Type": "application/json" } });
       }
+      if (!deviceAllowed(a)) return new Response("forbidden", { status: 403 });
       if (new URL(request.url).searchParams.get("meta")) {
         const meta = await env.APK?.get("appmeta");
         return new Response(meta || '{"code":0,"name":""}', { headers: { "Content-Type": "application/json" } });
@@ -510,10 +815,11 @@ export default {
     // Deletions the phone must mirror into its own SMS database. The phone reads rows past the
     // high-water mark it stored, decrypts each payload, and deletes the matching local SMS.
     if (path === "/api/deletions") {
-      const auth = request.headers.get("Authorization") || "";
-      if (!env.SEND_TOKEN || !auth.startsWith("Bearer ") || !safeEqual(auth.slice(7), env.SEND_TOKEN)) {
+      const a = await deviceAuth(request, env, url);
+      if (!a) {
         return new Response('{"error":"unauthorized"}', { status: 401, headers: { "Content-Type": "application/json" } });
       }
+      if (!deviceAllowed(a)) return new Response("forbidden", { status: 403 });
       const since = Number(new URL(request.url).searchParams.get("since") || "0") || 0;
       const rows = await env.DB.prepare(
         "SELECT id, payload FROM deletions WHERE id > ? ORDER BY id LIMIT 500"
@@ -595,7 +901,11 @@ export default {
               headers: { "Content-Type": "application/json" },
             });
       }
-      const res = path === "/" ? html(PAGE) : await handleList(request, env);
+      // The deploy timestamp is a binding, not a constant, so the page shows when the Worker
+      // actually shipped rather than whatever someone last remembered to edit.
+      const res = path === "/"
+        ? html(PAGE.replace("__BUILT__", env.CF_VERSION_METADATA?.timestamp || ""))
+        : await handleList(request, env);
       return request.method === "HEAD"
         ? new Response(null, { status: res.status, headers: res.headers })
         : res;
@@ -611,12 +921,20 @@ export default {
     // Prune deletion rows older than a week — every phone polling within that window has seen them.
     await env.DB.prepare("DELETE FROM deletions WHERE ts < ?").bind(Date.now() - 7 * 86_400_000).run();
     // Backstop for stuck sends: the poll-path only fails a row out when a phone actually polls, so
-    // a phone that goes offline mid-send leaves its row "发送中" forever. Fail any send still
-    // sending well past the claim window (20-min grace lets a briefly-offline phone resume first).
+    // a phone that goes offline mid-send leaves its row "发送中" forever.
+    //
+    // outbox.ts is the INSERT time and the claim never touches it, so this grace period is really
+    // "time since the row was written", not "time since it was claimed". At a 30 s poll that was
+    // the same thing to within half a minute; on the module's slow tier a row written at 22:05 is
+    // not claimed until 22:15, and a lost ack would then see this cron mark it 失败 somewhere
+    // between 20 and 35 minutes — overruling the two retries that failout/stale (MAX_CLAIMS) are
+    // there to give it, and putting "发送未完成" on screen for an SMS that actually went out.
+    // The claims guard puts this back to what the comment always claimed: only rows that already
+    // burned their retry budget.
     await env.DB.prepare(
       "UPDATE outbox SET status='failed', detail='发送未完成（手机离线/被杀），已超时' " +
-      "WHERE status='sending' AND ts <= ?"
-    ).bind(Date.now() - 20 * 60_000).run();
+      "WHERE status='sending' AND ts <= ? AND claims >= ?"
+    ).bind(Date.now() - 20 * 60_000, MAX_CLAIMS).run();
     const row = await env.DB.prepare("SELECT v FROM meta WHERE k='keepalive'").first();
     if (!row) return;
     let k; try { k = JSON.parse(row.v); } catch { return; }
@@ -636,8 +954,103 @@ export default {
         .bind(now, k.payload, k.dev || null),
       env.DB.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('keepalive', ?)").bind(JSON.stringify(k)),
     ]);
+    ctx.waitUntil(poke(env, k.dev || null));
   },
 };
+export default app;
+
+/* ------------------------------------------------------------ module sockets */
+
+// A module keeps one WebSocket open to the Hub and sends every request it would have made over
+// HTTPS through it instead: the Hub rebuilds the Request and hands it to app.fetch — the same
+// routes, the same deviceAuth, the same claims and acks — so the socket is only a cheaper pipe,
+// never a second protocol. What it buys: no TLS handshake per request (3.6 KB of every 5.2 KB
+// poll), and a push: the moment a send or a command is queued the Hub tells the module to poll.
+// If the socket is down the module makes the identical request over HTTPS, so nothing here is
+// load-bearing for correctness.
+//
+// Frames, both directions: one JSON line, "\n", then the raw body.
+//   module → Hub  {"i":<seq>,"m":"GET|POST","p":"/api/poll?dev=…","a":"Bearer …","t":"<content-type>"}
+//   Hub → module  {"i":<seq>,"c":<status>,"k":<part>,"n":<parts>}   — the reply, in parts (c=0: use HTTPS)
+//                 {"t":"poll"}                                      — something is waiting for you
+// Parts, because the module's receive buffer is 8 KB on builds without PSRAM and a bigger frame
+// makes it drop the connection. A poll carrying two long outbox rows is already past that.
+const TUNNEL_PART = 2000;   // chars; ≤3 UTF-8 bytes each, so a part stays under 6 KB on the wire
+const TUNNEL_MAX_BODY = 8192;
+// Only what a module sends over HTTPS today. Everything else (the web, OTA downloads, phones)
+// never comes through here, so a socket can't reach a route its HTTPS twin couldn't.
+const tunnelable = (path, env) =>
+  ["/api/poll", "/api/register", "/api/outbox/ack", "/api/cmd/ack", "/" + env.TOPIC].includes(path);
+
+// Tells the module(s) to poll now. Best effort: a missed poke costs one poll interval, nothing more.
+async function poke(env, dev) {
+  if (!env.HUB) return;
+  try {
+    await env.HUB.get(env.HUB.idFromName("hub")).fetch("https://hub/poke?dev=" + encodeURIComponent(dev || ""));
+  } catch {}
+}
+
+// One object for every module: there are a handful, and one place means a poke for an unaddressed
+// row (dev IS NULL) reaches all of them. Hibernation API throughout — no timers, no in-memory
+// state — so an idle socket costs no duration, and the module's 60 s protocol pings are answered
+// by the platform without waking the object at all.
+export class Hub extends DurableObject {
+  async fetch(request) {
+    const url = new URL(request.url);
+    const dev = url.searchParams.get("dev") || "";
+    if (url.pathname === "/poke") {
+      const socks = dev ? this.ctx.getWebSockets(dev) : this.ctx.getWebSockets();
+      for (const ws of socks) { try { ws.send('{"t":"poll"}'); } catch {} }
+      return new Response(String(socks.length));
+    }
+    // One socket per module. A reconnect usually means the old TCP died without a FIN (a cellular
+    // NAT dropped it), so the old socket is still here and would swallow every poke.
+    for (const old of this.ctx.getWebSockets(dev)) { try { old.close(1000, "replaced"); } catch {} }
+    const [client, server] = Object.values(new WebSocketPair());
+    this.ctx.acceptWebSocket(server, [dev]);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async webSocketMessage(ws, msg) {
+    const s = typeof msg === "string" ? msg : new TextDecoder().decode(msg);
+    const nl = s.indexOf("\n");
+    let m;
+    try { m = JSON.parse(nl < 0 ? s : s.slice(0, nl)); } catch { return; }
+    if (!Number.isInteger(m?.i)) return;
+    const body = nl < 0 ? "" : s.slice(nl + 1);
+    // c=0 means "not through here, use HTTPS": a refusal the HTTPS route would not have given must
+    // not reach the module as a 4xx, which its uploader treats as permanent and drops the message.
+    let code = 0, text = "";
+    const u = new URL(String(m.p || ""), "https://tunnel.invalid");
+    // The tunnelled ?dev= must be the socket's own: the bearer is re-checked by the route anyway,
+    // this just keeps one module's socket from carrying another's traffic.
+    if ((m.m === "GET" || m.m === "POST") && tunnelable(u.pathname, this.env) &&
+        u.searchParams.get("dev") === this.ctx.getTags(ws)[0] && body.length <= TUNNEL_MAX_BODY) {
+      const headers = { Authorization: String(m.a || "") };
+      if (m.t) headers["Content-Type"] = String(m.t);
+      try {
+        const res = await app.fetch(new Request(u, { method: m.m, headers, body: m.m === "POST" ? body : undefined }), this.env, this.ctx);
+        code = res.status; text = await res.text();
+      } catch { code = 0; text = ""; }
+    }
+    const parts = [];
+    let k = 0;
+    do {
+      let e = Math.min(k + TUNNEL_PART, text.length);
+      if (e < text.length && /[\ud800-\udbff]/.test(text[e - 1])) e--;   // never split a surrogate pair
+      parts.push(text.slice(k, e));
+      k = e;
+    } while (k < text.length);
+    try {
+      parts.forEach((p, n) => ws.send(JSON.stringify({ i: m.i, c: code, k: n, n: parts.length }) + "\n" + p));
+    } catch {}   // the socket went away mid-request: the module times out and retries over HTTPS
+  }
+
+  // Before compatibility_date 2026-04-07 the runtime does not answer a client's close frame itself.
+  async webSocketClose(ws) {
+    try { ws.close(1000, "bye"); } catch {}
+  }
+}
 
 function html(body, status = 200) {
   // no-store: the app HTML/JS changes often and there is no build hash on it, so without this a
@@ -903,6 +1316,8 @@ const LIST_CSS = `
   backdrop-filter:saturate(1.6) blur(12px);border-bottom:1px solid var(--line);
 }
 .top h1{font-size:15px;font-weight:650;margin:0;white-space:nowrap}
+.top .who{display:flex;flex-direction:column;gap:2px;min-width:0}
+.top .ver{font-size:11px;line-height:1;color:var(--muted);white-space:nowrap}
 .dot{width:7px;height:7px;border-radius:50%;background:#22c55e;flex:none}
 .dot.bad{background:var(--danger)}
 .spacer{flex:1}
@@ -957,6 +1372,29 @@ li.fresh{background:var(--fresh);border-color:var(--fresh-line)}
    wraps instead of ellipsising, and the card widens a little to give it room. */
 .dev-warn{color:var(--danger);font-weight:600;white-space:normal;line-height:1.35}
 .dev-cap{color:#22c55e;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* A module's IMEI/ICCID and 脚本/固件/ota lines: these are exactly what you read to tell two
+   boards apart and to decide what to push, so they wrap rather than ellipsise. */
+.dev-id{font-size:11.5px;color:var(--muted);margin-top:2px;padding-left:15px;white-space:normal;line-height:1.4;overflow-wrap:anywhere}
+/* Self-registered modules. A pending card is the one thing on the strip that wants a click, so it
+   gets the amber ring the rest of the page never uses; blocked is deliberately dull. */
+.dev.pend{border-color:#f59e0b;box-shadow:0 0 0 2px rgba(245,158,11,.28)}
+.dev.pend.on{box-shadow:0 0 0 2px var(--ring),0 0 0 4px rgba(245,158,11,.28)}
+.dev.blk{opacity:.7}
+.dev-badge{flex:none;font-size:10px;font-weight:700;padding:1px 6px;border-radius:5px;white-space:nowrap;line-height:1.5}
+.dev-badge.pend{color:#b45309;background:rgba(245,158,11,.2)}
+.dev-badge.blk{color:var(--muted);background:color-mix(in srgb,var(--muted) 16%,transparent)}
+/* Trust + command buttons live on their own row at the bottom of the card, small enough that a
+   card with three of them is still narrower than a phone screen. */
+.dev-acts{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
+.dev-acts button{font-size:11px;padding:2px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink);cursor:pointer;line-height:1.6;white-space:nowrap}
+.dev-acts button:hover{border-color:var(--muted)}
+.dev-acts button.ok{color:#16a34a;border-color:color-mix(in srgb,#22c55e 45%,transparent);font-weight:600}
+.dev-acts button.bad{color:var(--danger)}
+.dev-acts button:disabled{opacity:.5;cursor:default}
+/* Last command and its outcome — the module's own words (bytes written, why the HMAC failed). */
+.dev-cmd{font-size:11px;color:var(--muted);margin-top:3px;white-space:normal;line-height:1.35;overflow-wrap:anywhere}
+.dev-cmd.fail{color:var(--danger)}
+.dev-cmd .undo{color:var(--accent);cursor:pointer;margin-left:4px;font-weight:600}
 .dev-all{flex:none;display:flex;align-items:center;padding:0 11px;border:1px dashed var(--line);border-radius:9px;font-size:11.5px;color:var(--muted);cursor:pointer;white-space:nowrap}
 .dev-all.on{color:var(--accent);border-style:solid;border-color:var(--accent);font-weight:600;cursor:default}
 .dev-top{display:flex;align-items:center;gap:7px}
@@ -1063,6 +1501,22 @@ dialog input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px 
 .row{display:flex;gap:8px;justify-content:flex-end}
 .row button{padding:9px 16px;border-radius:9px;border:1px solid var(--line);background:var(--card);color:var(--ink);cursor:pointer;font-size:14px}
 .row button.primary{background:var(--accent);color:var(--accent-ink);border-color:transparent;font-weight:600}
+/* 短信指令 composer. The field vocabulary is the one the 发短信/定时保号 dialogs already use,
+   lifted out of their inline styles because this dialog has six of them. */
+.fl{display:block;font-size:13px;color:var(--muted);margin:-4px 0 6px}
+.fs{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid var(--line);border-radius:9px;background:var(--bg);color:var(--ink);font-size:16px;margin-bottom:14px}
+.fh{color:var(--muted);font-size:12.5px;line-height:1.55;margin:10px 0 0}
+/* The line to send: selectable and wrapping, because the fallback when the QR won't scan is
+   reading or copying it by hand. */
+.smsline{
+  font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--bg);
+  border:1px solid var(--line);border-radius:9px;padding:10px 12px;overflow-wrap:anywhere;
+  user-select:all;-webkit-user-select:all;
+}
+/* White ground regardless of the page theme: a scanner reading a dark-on-dark QR sees nothing,
+   and the quiet zone is part of the SVG so no padding may eat into it. */
+.qrbox{display:flex;justify-content:center;margin-top:14px}
+.qrbox svg{width:240px;height:240px;max-width:100%;background:#fff;border-radius:10px;display:block}
 `;
 
 const PAGE = `<!doctype html>
@@ -1078,7 +1532,7 @@ const PAGE = `<!doctype html>
 </head><body>
 <header class="top">
   <span class="dot" id="dot"></span>
-  <h1>短信转发</h1>
+  <div class="who"><h1>短信转发</h1><span class="ver" id="ver"></span></div>
   <span class="spacer"></span>
   <button class="out" id="sendBtn" type="button">发短信</button>
   <button class="out" id="balBtn" type="button">话费</button>
@@ -1090,9 +1544,14 @@ const PAGE = `<!doctype html>
   <button class="mitem" id="testPushBtn" type="button" role="menuitem"><span>测试推送</span></button>
   <button class="mitem" id="keyBtn" type="button" role="menuitem">密钥</button>
   <button class="mitem" id="kaBtn" type="button" role="menuitem">定时保号</button>
+  <!-- Deliberately here and not only on a module card: this is the path for when there IS no
+       card — the module is offline, blocked, or was forgotten, or the page never saw it. -->
+  <button class="mitem" id="smsCmdBtn" type="button" role="menuitem">短信指令</button>
   <a class="mitem danger" href="/logout" role="menuitem">退出</a>
 </div>
 <main><div id="beat"></div><div id="kaStatus"></div><div id="outbox"></div><ul id="list"><li class="empty">加载中…</li></ul></main>
+<!-- 更新脚本… on a module card opens this; which module is kept in data-dev while the picker is up. -->
+<input type="file" id="otaFile" accept=".lua,text/x-lua,text/plain" hidden>
 
 <dialog id="keyDlg">
   <h2>解密密钥</h2>
@@ -1155,6 +1614,52 @@ const PAGE = `<!doctype html>
   </div>
 </dialog>
 
+<dialog id="smsDlg">
+  <h2>短信指令</h2>
+  <p>网页或域名都够不着模组时用这条：把下面生成的那一行发给模组的 SIM 卡号，模组验签后执行。
+     整行在这台设备上生成并签名，号码只用来做二维码，不上传。</p>
+  <label class="fl" for="smsTo">目标号码（模组那张 SIM）</label>
+  <input id="smsTo" class="fs" placeholder="模组的手机号" inputmode="tel" autocomplete="off">
+  <label class="fl" for="smsCmdSel">指令</label>
+  <select id="smsCmdSel" class="fs">
+    <option value="status">状态</option>
+    <option value="reboot">重启</option>
+    <option value="bases">改域名</option>
+    <option value="reset">恢复默认域名</option>
+    <option value="ota">更新脚本</option>
+    <option value="otaclear">清除更新</option>
+  </select>
+  <label class="fl" for="smsQrFmt">二维码格式（扫不出来 / 号码跑进正文，就换一个）</label>
+  <select id="smsQrFmt" class="fs">
+    <option value="smsto">SMSTO:（多数扫码 App、Google 相机）</option>
+    <option value="sms">sms:?body=（Android 原生相机、部分国产 ROM）</option>
+    <option value="smsamp">sms:&amp;body=（iPhone 相机）</option>
+    <option value="text">纯文本（扫出来自己复制，最保险）</option>
+  </select>
+  <div id="smsUrlWrap" hidden>
+    <label class="fl" for="smsUrl">新的服务器地址，多个用逗号分隔（必须 https://）</label>
+    <input id="smsUrl" class="fs" placeholder="https://a.example,https://b.example" spellcheck="false" autocomplete="off">
+  </div>
+  <div id="smsOtaWrap" hidden>
+    <label class="fl" for="smsOtaFile">脚本文件（文件名决定替换哪个：gw.lua / gcm.lua）</label>
+    <input type="file" id="smsOtaFile" class="fs" accept=".lua,text/x-lua,text/plain">
+    <div id="smsOtaLast"></div>
+    <p id="smsOtaNote" class="fh"></p>
+  </div>
+  <div class="row">
+    <button type="button" id="smsClose">关闭</button>
+    <button type="button" class="primary" id="smsGo">生成</button>
+  </div>
+  <div id="smsOut" hidden>
+    <div id="smsLine" class="smsline"></div>
+    <div class="row" style="justify-content:flex-start;margin-top:10px">
+      <button type="button" id="smsCopy">复制</button>
+    </div>
+    <div id="smsQr" class="qrbox"></div>
+    <p id="smsHint" class="fh"></p>
+  </div>
+</dialog>
+
 <dialog id="threadDlg">
   <div class="thead">
     <span id="threadName"></span>
@@ -1182,6 +1687,18 @@ let maxId = 0, unread = 0, first = true;
 const INBOX = new Map();  // id -> {id, ts, number, sender, body}
 let SENT = [];            // [{id, ts, number, to, body, status, detail}]
 const norm = (x) => String(x || "").replace(/[^0-9+]/g, "");  // [0-9] not \\d — template-safe
+
+// Stamped per deploy from the version_metadata binding, so it can never go stale the way a
+// hand-bumped version string does. Empty only if the binding is missing (old wrangler.toml).
+(() => {
+  const iso = "__BUILT__";
+  const el = document.getElementById("ver");
+  const d = iso ? new Date(iso) : null;
+  if (!el || !d || isNaN(d)) return;
+  const p = (n) => String(n).padStart(2, "0");
+  el.textContent = "发布于 " + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes());
+  el.title = d.toLocaleString();
+})();
 
 function when(ms){
   const d = new Date(ms), diff = (Date.now() - ms) / 1000;
@@ -1508,12 +2025,127 @@ function applyDevFilter(){
 // on phones that were merely dozing. Four missed polls is a genuine outage; two is a nap. Actual
 // freezing is reported separately and precisely by the gap counters, which is the better signal.
 const ONLINE_MS = 20 * 60000;
+// The module polls on a schedule, not continuously: 120 s in the UTC 06-22 window and 600 s
+// outside it. Judging it by the phone's 20-minute rule paints the card red every night for a
+// module that is working perfectly — and worst, at exactly the hour the owner last checks the
+// page. Four missed slow-tier polls is a real fault; two is bedtime.
+const MODULE_ONLINE_MS = 45 * 60000;
 const ago = (ms) => {
   const m = Math.floor(ms / 60000);
   if (m < 1) return "不到 1 分钟";
   if (m < 60) return m + " 分钟";
   const h = Math.floor(m / 60);
   return h < 24 ? h + " 小时" : Math.floor(h / 24) + " 天";
+};
+
+/* --- self-registered modules: trust, commands, script update --- */
+// Last command per module id ({id, ts, payload, status, detail} or null), from /api/cmd/list.
+// Fetched once per module, then only while its last command is still pending (the module acks
+// within one poll of picking it up) or right after the web queued a new one — not every 10s for
+// every device forever.
+const CMDS = new Map();
+const CMD_DIRTY = new Set();
+const CMD_LABEL = { reboot: "重启", ota: "更新脚本", bases: "改域名" };
+const CMD_STATE = { pending: "待执行", done: "已完成", failed: "失败" };
+
+async function refreshCmd(dev){
+  const cur = CMDS.get(dev);
+  if (CMDS.has(dev) && !CMD_DIRTY.has(dev) && !(cur && cur.status === "pending")) return;
+  try {
+    const r = await fetch("/api/cmd/list?dev=" + encodeURIComponent(dev), { cache: "no-store" });
+    if (!r.ok) return;
+    const rows = await r.json();
+    CMDS.set(dev, rows[0] || null);
+    CMD_DIRTY.delete(dev);
+  } catch {}
+}
+
+// One line for the card: "更新脚本 gw · 已完成 · 18234" / "重启 · 失败 · …". The payload is the
+// server's plain JSON, so this needs no key.
+function cmdSummary(c){
+  if (!c) return "";
+  let p = {}; try { p = JSON.parse(c.payload); } catch {}
+  const what = (CMD_LABEL[p.type] || p.type || "命令") + (p.name ? " " + p.name : "");
+  return [what, CMD_STATE[c.status] || c.status, c.detail || ""].filter(Boolean).join(" · ");
+}
+
+async function setTrust(id, status){
+  const r = await fetch("/api/device/trust", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, status }),
+  });
+  if (r.status === 401) { location.href = "/login"; return; }
+  if (!r.ok) { alert("操作失败：" + r.status); return; }
+  lastBeatSig = null;
+  renderBeat();
+}
+
+// Queue a command; the module runs it on its next poll. 409 means one is still waiting — the
+// server allows one at a time, because most of them end in a reboot.
+async function postCmd(dev, body){
+  const r = await fetch("/api/cmd", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(Object.assign({ dev }, body)),
+  });
+  if (r.status === 401) { location.href = "/login"; return false; }
+  if (r.status === 409) { alert("这台设备还有一条命令没执行完，等它完成或先撤销。"); return false; }
+  if (!r.ok) { alert("命令下发失败：" + r.status + " " + (await r.text().catch(() => ""))); return false; }
+  CMD_DIRTY.add(dev);
+  lastBeatSig = null;
+  renderBeat();
+  return true;
+}
+
+async function undoCmd(dev, id){
+  const r = await fetch("/api/cmd/" + id, { method: "DELETE" });
+  if (r.status === 401) { location.href = "/login"; return; }
+  CMD_DIRTY.add(dev);
+  lastBeatSig = null;
+  renderBeat();
+}
+
+// The command signature. HMAC-SHA256 over name + a newline + the exact bytes under SMS_KEY —
+// the same key that encrypts messages, and the one thing the server never has. (Written out in
+// prose because this comment is inside the page template literal: a backslash-n here would be
+// served as a real line break and split the comment in two.) The name is bound
+// into the signature, so a file signed for gw can never be installed as gcm and an "ota"
+// signature can never pass as a "bases" one. Used by 更新脚本 (name "gw"/"gcm", bytes = the
+// file) and by 改域名 (name "bases", bytes = the normalised address list). The module
+// recomputes it over what it received and refuses anything that doesn't match, so neither a
+// Worker compromise nor an on-path attacker can push code or move the module elsewhere.
+async function hmacHex(name, bytes){
+  const hex = (localStorage.getItem("sms_key") || "").toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(hex)) throw new Error("未设置密钥");
+  const k = await crypto.subtle.importKey("raw", hexToBytes(hex), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const prefix = new TextEncoder().encode(name + "\\n");
+  const data = new Uint8Array(prefix.length + bytes.byteLength);
+  data.set(prefix, 0); data.set(new Uint8Array(bytes), prefix.length);
+  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", k, data));
+  return [...sig].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+const otaFile = document.getElementById("otaFile");
+otaFile.onchange = async () => {
+  const dev = otaFile.dataset.dev, f = otaFile.files[0];
+  otaFile.value = "";
+  if (!dev || !f) return;
+  // Which slot the file goes to comes from its name: the module keeps exactly gw.lua and gcm.lua.
+  const m = /^(gw|gcm)\\.lua$/i.exec(f.name);
+  if (!m) { alert("文件名必须是 gw.lua 或 gcm.lua（决定替换模组上的哪个脚本）。"); return; }
+  const name = m[1].toLowerCase();
+  if (!confirm("把 " + f.name + "（" + f.size + " 字节）推送到「" + (DEVS.get(dev)?.name || dev) + "」？模组校验签名后写入并重启。")) return;
+  try {
+    const bytes = await f.arrayBuffer();
+    const hmac = await hmacHex(name, bytes);
+    // The hmac rides along so it is stored beside the file: an SMS "#ota <slot> <hmac>" is
+    // nothing but that value, and 短信指令 can then offer this upload without the file again.
+    const r = await fetch("/api/ota/put?name=" + name + "&hmac=" + hmac, { method: "POST", body: bytes });
+    if (r.status === 401) { location.href = "/login"; return; }
+    if (!r.ok) { alert("上传失败：" + r.status + " " + (await r.text().catch(() => ""))); return; }
+    await postCmd(dev, { type: "ota", name, hmac });
+  } catch (e) {
+    alert("更新脚本失败：" + (e && e.message ? e.message : e));
+  }
 };
 
 async function renderBeat(){
@@ -1528,11 +2160,20 @@ async function renderBeat(){
     if (d.info && cryptoKey) { try { info = await openSend(d.info); } catch {} }
     next.set(d.id, {
       id: d.id, ts: d.ts, name: info?.n || ("设备 " + d.id.slice(0, 4)),
-      sims: info?.s || [], caps: info?.c || null, gaps: info?.g || null, ver: info?.v || null, tr: info?.t || null, os: info?.os || null, ls: info?.ls || null,
+      sims: Array.isArray(info?.s) ? info.s : [], caps: info?.c || null, gaps: info?.g || null, ver: info?.v || null, tr: info?.t || null, os: info?.os || null, ls: info?.ls || null,
       cap: info?.cap || null, pp: info?.pp || null, ln: info?.ln || null,
+      // Module registry: status is server-side (the web sets it); the rest is the module's own
+      // self-description, so the card can say which physical device this is.
+      status: d.status || "trusted", module: !!d.module,
+      imei: info?.imei || null, iccid: info?.iccid || null, fw: info?.fw || null, sver: info?.ver || null,
+      // The module's own SIM number, when the firmware could read it off the card. Never shown
+      // on the card — it is only the initial value the 短信指令 composer offers for 目标号码.
+      num: info?.num || null,
+      ota: info?.ota || null, boot: info?.boot ?? null,
     });
   }
   DEVS = next;
+  for (const d of next.values()) if (d.module && d.status === "trusted") await refreshCmd(d.id);
 
   // Skip the rebuild when nothing shown has changed. Polling every 10s was clearing and recreating
   // every card each time — that full repaint is the flicker. The signature covers only what is
@@ -1544,7 +2185,8 @@ async function renderBeat(){
     empty: devs.length ? 0 : (data.beat || 0),
     devs: [...next.values()].map((d) => {
       const on = nowB - d.ts < ONLINE_MS;
-      return [d.id, on, d.name, d.caps, d.gaps, d.sims, d.ver, d.tr, d.os, d.ls, on ? 0 : ago(nowB - d.ts)];
+      return [d.id, on, d.name, d.caps, d.gaps, d.sims, d.ver, d.tr, d.os, d.ls, on ? 0 : ago(nowB - d.ts),
+        d.status, d.module, d.imei, d.iccid, d.fw, d.sver, d.ota, d.boot, cmdSummary(CMDS.get(d.id))];
     }),
   });
   if (sig === lastBeatSig) return;
@@ -1577,7 +2219,7 @@ async function renderBeat(){
   }
   for (const d of DEVS.values()) {
     const age = Date.now() - d.ts;
-    const on = age < ONLINE_MS;
+    const on = age < (d.module ? MODULE_ONLINE_MS : ONLINE_MS);
     // Liveness (the dot) and capability (can it still capture an SMS) are different questions: an
     // incoming SMS wakes even a frozen phone, so a dead poll does not mean lost messages. Show
     // them as two states. Any armed capture path — the notification listener, the default-SMS
@@ -1589,13 +2231,24 @@ async function renderBeat(){
     // the single-row version wrapped in the middle of a word.
     const box = document.createElement("div");
     box.className = ACTIVE_DEV === d.id ? "dev on" : "dev";
+    // A module that isn't trusted yet is the card you came to click, so it stands out; a blocked
+    // one fades but stays listed — it is still registering, and 忘记 is how it really goes away.
+    if (d.module && d.status === "pending") box.classList.add("pend");
+    if (d.module && d.status === "blocked") box.classList.add("blk");
     box.title = ACTIVE_DEV === d.id ? "再点一次显示全部设备" : "只看这台设备";
-    box.onclick = (e) => { if (!e.target.closest(".del")) setActiveDev(d.id); };
+    box.onclick = (e) => { if (!e.target.closest(".del,.dev-acts,.dev-cmd")) setActiveDev(d.id); };
     const top = document.createElement("div"); top.className = "dev-top";
     const dot = document.createElement("span");
     dot.textContent = "●"; dot.style.color = on ? "#22c55e" : "var(--danger)";
     const name = document.createElement("span"); name.className = "dev-name";
     name.textContent = d.name;
+    // Trusted needs no badge — that is the state every phone has always been in.
+    if (d.module && d.status !== "trusted") {
+      const badge = document.createElement("span");
+      badge.className = "dev-badge " + (d.status === "pending" ? "pend" : "blk");
+      badge.textContent = d.status === "pending" ? "待信任" : "已拉黑";
+      top.append(badge);
+    }
     const state = document.createElement("span"); state.className = "dev-state";
     // Offline text goes calm (not red) when the phone can still forward — the red dot already
     // carries the liveness signal, and a red "离线" beside a working phone is the false alarm this
@@ -1622,9 +2275,13 @@ async function renderBeat(){
       const cap = document.createElement("div"); cap.className = "dev-warn";
       cap.textContent = "⚠ 收不到短信 · 检查通知访问/默认短信应用";
       sub.append(cap);
-    } else if (canForward === true && !on) {
+    } else if ((canForward === true || d.module) && !on) {
       // Online + working needs no line — the green dot already says it. The reassurance is only
-      // worth showing when the phone is OFFLINE, so the red dot isn't misread as "stopped receiving".
+      // worth showing when the device is OFFLINE, so the red dot isn't misread as "stopped receiving".
+      // The module needs it more than any phone does: its register blob carries no caps (name,
+      // imei, iccid, imsi, num, fw, ver, ota, boot — no capability fields), so canForward is null
+      // and without the d.module arm it got a red dot and no explanation at all. Inbound SMS is
+      // pushed the moment it arrives, so a sleeping poll really does forward nothing more slowly.
       const cap = document.createElement("div"); cap.className = "dev-cap";
       cap.textContent = "● 仍可接收转发（离线只是轮询睡了）";
       sub.append(cap);
@@ -1681,7 +2338,7 @@ async function renderBeat(){
     }
     // System version (Android + ColorOS/…): reported by the phone so the ROM is visible from here
     // — needed to tell a device what its exact keep-alive/permission settings paths are.
-    if (d.os) {
+    if (d.os && !d.module) {
       const o = document.createElement("div"); o.className = "dev-sims";
       o.textContent = String(d.os);
       sub.append(o);
@@ -1744,13 +2401,97 @@ async function renderBeat(){
     // Footer row: the app version (left) and, watermarked bottom-right, the connection type the
     // phone last reported — "WIFI"/"4G"/"5G"/… . No emoji, muted; the label alone says whether it
     // is on Wi-Fi or burning the SIM's data. Legacy v1.5 phones send "cell" (no generation) → 蜂窝.
-    if (d.ver || d.tr) {
+    if ((d.ver || d.tr) && !d.module) {
       const net = d.tr === "cell" ? "蜂窝" : (d.tr || "");
       const line = document.createElement("div"); line.className = "dev-net";
       line.textContent = [net, d.ver ? "v" + d.ver : ""].filter(Boolean).join(" · ");
       sub.append(line);
     }
     box.append(top, sub);
+    if (d.module) {
+      // Which physical module is this? Last 6 of IMEI/ICCID is enough to match the sticker on the
+      // board or the SIM, and short enough to fit; the carrier already shows on the SIM line above.
+      // Firmware / script / active OTA slot / boot-fail counter are what you look at before
+      // deciding whether to push an update or just reboot.
+      const idl = [d.imei ? "IMEI …" + String(d.imei).slice(-6) : "", d.iccid ? "ICCID …" + String(d.iccid).slice(-6) : ""].filter(Boolean);
+      if (idl.length) {
+        const l = document.createElement("div"); l.className = "dev-id";
+        l.textContent = idl.join(" · "); l.title = l.textContent;
+        sub.append(l);
+      }
+      const swl = [d.sver ? "脚本 " + d.sver : "", d.fw ? "固件 " + d.fw : "",
+        // Both of these are only worth the width when they are NOT the healthy value: an active
+        // OTA copy, or a module that has been failing to boot.
+        d.ota && d.ota !== "-" ? "ota " + d.ota : "",
+        Number(d.boot) > 0 ? "重启 " + d.boot : ""].filter(Boolean);
+      if (swl.length) {
+        const l = document.createElement("div"); l.className = "dev-id";
+        l.textContent = swl.join(" · "); l.title = l.textContent;
+        sub.append(l);
+      }
+      const acts = document.createElement("div"); acts.className = "dev-acts";
+      const mk = (label, cls, fn) => {
+        const b = document.createElement("button"); b.type = "button"; b.textContent = label;
+        if (cls) b.className = cls;
+        b.onclick = async (e) => { e.stopPropagation(); b.disabled = true; try { await fn(); } finally { b.disabled = false; } };
+        acts.append(b);
+      };
+      const block = async () => {
+        if (confirm("拉黑「" + d.name + "」？它将不能上报、也收不到发送任务，随时可再信任。")) await setTrust(d.id, "blocked");
+      };
+      if (d.status !== "trusted") mk("信任", "ok", () => setTrust(d.id, "trusted"));
+      // A stranger's card offers 拉黑 as well: 忘记 only deletes the row, and the module is back as
+      // 待信任 on its next attempt. Blocked rows also stop counting toward the pending cap.
+      if (d.status === "pending") mk("拉黑", "bad", block);
+      if (d.status === "trusted") {
+        mk("重启", "", async () => { if (confirm("重启「" + d.name + "」？")) await postCmd(d.id, { type: "reboot" }); });
+        mk("改域名…", "", async () => {
+          // Signed with SMS_KEY like 更新脚本 is, and for a bigger reason: this is the one command
+          // that can move the module to someone else's server for good. Without the key we cannot
+          // sign, and the module would refuse it — so say so before asking for anything.
+          if (!cryptoKey) { alert("请先点「密钥」填入 SMS_KEY —— 脚本要用它签名，模组才会接受。"); return; }
+          const v = prompt("新的服务器地址，多个用逗号分隔（必须 https://）。模组保存后会重启：", location.origin);
+          if (v == null) return;
+          // Same rule as the server's okUrl: https, host[:port][/path], nothing the module's
+          // "/api/…" join could trip over (no ?, #, quotes, escapes), trailing "/" dropped.
+          const list = v.split(",").map((s) => s.trim().replace(/\\/+$/, "")).filter(Boolean);
+          const okUrl = (s) => s.length <= 120 && /^https:\\/\\/[A-Za-z0-9.-]+(:[0-9]+)?(\\/[A-Za-z0-9._~\\/-]*)?$/.test(s);
+          if (!list.length || list.length > 5 || !list.every(okUrl)) {
+            alert("每个地址都要以 https:// 开头，只能是域名[:端口][/路径]（不能带 ?、# 或引号），最多 5 个，每个不超过 120 字符。"); return;
+          }
+          // Sign the normalised list — exactly the bytes the server stores and the module verifies.
+          const value = list.join(",");
+          try {
+            const hmac = await hmacHex("bases", new TextEncoder().encode(value));
+            await postCmd(d.id, { type: "bases", value, hmac });
+          } catch (e) {
+            alert("改域名失败：" + (e && e.message ? e.message : e));
+          }
+        });
+        mk("更新脚本…", "", async () => {
+          if (!cryptoKey) { alert("请先点「密钥」填入 SMS_KEY —— 脚本要用它签名，模组才会接受。"); return; }
+          otaFile.dataset.dev = d.id;
+          otaFile.click();
+        });
+        mk("拉黑", "bad", block);
+      }
+      // Always offered, whatever the trust state: a blocked, never-trusted or long-offline
+      // module is exactly the one the web can no longer reach, and SMS is the way back in.
+      mk("短信…", "", () => openSmsDlg(d.id));
+      box.append(acts);
+      const c = CMDS.get(d.id);
+      if (d.status === "trusted" && c) {
+        const l = document.createElement("div"); l.className = "dev-cmd" + (c.status === "failed" ? " fail" : "");
+        l.textContent = cmdSummary(c);
+        if (c.status === "pending") {
+          const u = document.createElement("span"); u.className = "undo"; u.textContent = "撤销";
+          u.title = "模组还没取走这条命令，可以撤回";
+          u.onclick = (e) => { e.stopPropagation(); undoCmd(d.id, c.id); };
+          l.append(u);
+        }
+        box.append(l);
+      }
+    }
     beatEl.append(box);
   }
   applyDevFilter();
@@ -1910,6 +2651,8 @@ async function fillSim(sel){
   sel.append(new Option(DEVS.size > 1 ? "默认（任意手机的默认卡）" : "默认卡", ""));
   for (const d of DEVS.values()) {
     if (ACTIVE_DEV && d.id !== ACTIVE_DEV) continue;   // page is filtered to one phone
+    // A pending/blocked module can't claim a send; offering its SIM would just park the row.
+    if (d.status && d.status !== "trusted") continue;
     if (d.sims.length) {
       for (const c of d.sims) {
         // Always name the phone, even with only one paired: the whole reason device ids exist is
@@ -2325,6 +3068,437 @@ if ("serviceWorker" in navigator) {
     if (e.data && e.data.type === "sms") poll();
   });
 }
+
+/* ============================================================== QR encoder ==
+   Inlined, and this is the one place on the page where that is load-bearing: the 短信指令
+   composer below exists for the moment the Worker or the domain cannot be reached, so a CDN
+   would be exactly as unreachable as everything else it is meant to rescue. Byte mode, ECC
+   level M, versions 1-10 — enough for every command this dialog can build (213 bytes at the
+   top end) and small enough to read in one sitting.
+
+   Everything the spec says about whether a phone can actually read the result is here:
+   mode+length header, terminator and EC/11 padding, Reed-Solomon per block with the real
+   block layout, interleaving, function patterns, BCH-protected format and (v7+) version
+   info, and all eight data masks scored by the four penalty rules — the mask is chosen, not
+   hardcoded, because a bad one on a given payload is a QR that will not scan.            */
+
+// [data codewords, EC codewords per block, group-1 blocks, group-2 blocks] per version, ECC M.
+// A group-2 block holds exactly one data codeword more than a group-1 one.
+const QR_ECC = [
+  [16, 10, 1, 0], [28, 16, 1, 0], [44, 26, 1, 0], [64, 18, 2, 0], [86, 24, 2, 0],
+  [108, 16, 4, 0], [124, 18, 4, 0], [154, 22, 2, 2], [182, 22, 3, 2], [216, 26, 4, 1],
+];
+// Alignment-pattern centre coordinates per version; every pair of them carries a pattern
+// except the three that would sit on a finder.
+const QR_ALIGN = [[], [6,18], [6,22], [6,26], [6,30], [6,34], [6,22,38], [6,24,42], [6,26,46], [6,28,50]];
+
+// GF(256) with the QR primitive polynomial 0x11d, as log/antilog tables — the doubled exp
+// table lets a product skip the modulo on the exponent.
+const GF_EXP = new Uint8Array(512), GF_LOG = new Uint8Array(256);
+(() => {
+  let x = 1;
+  for (let i = 0; i < 255; i++) { GF_EXP[i] = x; GF_LOG[x] = i; x <<= 1; if (x & 0x100) x ^= 0x11d; }
+  for (let i = 255; i < 512; i++) GF_EXP[i] = GF_EXP[i - 255];
+})();
+const gfMul = (a, b) => (a && b) ? GF_EXP[GF_LOG[a] + GF_LOG[b]] : 0;
+
+// The RS generator polynomial of degree n, highest coefficient first.
+function qrRsGen(n){
+  let g = [1];
+  for (let i = 0; i < n; i++){
+    const next = new Array(g.length + 1).fill(0);
+    for (let j = 0; j < g.length; j++){ next[j] ^= g[j]; next[j + 1] ^= gfMul(g[j], GF_EXP[i]); }
+    g = next;
+  }
+  return g;
+}
+// The remainder of data(x)*x^ecLen over the generator: the block's EC codewords.
+function qrRs(data, ecLen){
+  const g = qrRsGen(ecLen), res = new Uint8Array(data.length + ecLen);
+  res.set(data);
+  for (let i = 0; i < data.length; i++){
+    const f = res[i];
+    if (!f) continue;
+    for (let j = 0; j < g.length; j++) res[i + j] ^= gfMul(g[j], f);
+  }
+  return res.slice(data.length);
+}
+
+// The eight data masks, by their spec condition (x = column, y = row).
+const QR_MASK = [
+  (x, y) => (x + y) % 2 === 0,
+  (x, y) => y % 2 === 0,
+  (x, y) => x % 3 === 0,
+  (x, y) => (x + y) % 3 === 0,
+  (x, y) => (Math.floor(y / 2) + Math.floor(x / 3)) % 2 === 0,
+  (x, y) => (x * y) % 2 + (x * y) % 3 === 0,
+  (x, y) => ((x * y) % 2 + (x * y) % 3) % 2 === 0,
+  (x, y) => ((x + y) % 2 + (x * y) % 3) % 2 === 0,
+];
+
+// The four penalty rules, lower is better: long same-colour runs, 2x2 blocks, anything that
+// looks like a finder, and an unbalanced dark/light ratio.
+function qrPenalty(mod, size){
+  let p = 0;
+  for (let t = 0; t < 2; t++){
+    for (let i = 0; i < size; i++){
+      let line = "";
+      for (let j = 0; j < size; j++) line += (t === 0 ? mod[i][j] : mod[j][i]) ? "1" : "0";
+      let run = 1;
+      for (let j = 1; j < size; j++){
+        if (line[j] === line[j - 1]) run++;
+        else { if (run >= 5) p += 3 + run - 5; run = 1; }
+      }
+      if (run >= 5) p += 3 + run - 5;
+      // 1:1:3:1:1 with four light modules on one side — the finder's own signature, which is
+      // why a scanner mistakes it for one.
+      for (let j = 0; j + 11 <= size; j++){
+        const s = line.slice(j, j + 11);
+        if (s === "10111010000" || s === "00001011101") p += 40;
+      }
+    }
+  }
+  for (let y = 0; y + 1 < size; y++) for (let x = 0; x + 1 < size; x++){
+    const v = mod[y][x];
+    if (v === mod[y][x + 1] && v === mod[y + 1][x] && v === mod[y + 1][x + 1]) p += 3;
+  }
+  let dark = 0;
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) dark += mod[y][x];
+  p += Math.floor(Math.abs(dark * 100 / (size * size) - 50) / 5) * 10;
+  return p;
+}
+
+// → {size, mod} (mod[y][x] = 0|1), or null when the payload does not fit version 10.
+function qrEncode(str){
+  const bytes = new TextEncoder().encode(str);
+  let ver = 0;
+  for (let v = 1; v <= 10; v++){
+    if (bytes.length * 8 + 4 + (v < 10 ? 8 : 16) <= QR_ECC[v - 1][0] * 8) { ver = v; break; }
+  }
+  if (!ver) return null;
+  const dcw = QR_ECC[ver - 1][0], ecLen = QR_ECC[ver - 1][1];
+  const g1 = QR_ECC[ver - 1][2], g2 = QR_ECC[ver - 1][3], nb = g1 + g2;
+
+  // --- bit stream: mode 0100, the length, the bytes, a 4-bit terminator, then EC/11 padding
+  const bits = [];
+  const put = (val, len) => { for (let i = len - 1; i >= 0; i--) bits.push((val >> i) & 1); };
+  put(4, 4);
+  put(bytes.length, ver < 10 ? 8 : 16);
+  for (const b of bytes) put(b, 8);
+  for (let i = 0; i < 4 && bits.length < dcw * 8; i++) bits.push(0);
+  while (bits.length % 8) bits.push(0);
+  const data = new Uint8Array(dcw);
+  for (let i = 0; i < bits.length; i += 8){
+    let b = 0;
+    for (let j = 0; j < 8; j++) b = (b << 1) | bits[i + j];
+    data[i / 8] = b;
+  }
+  for (let i = bits.length / 8, pad = 0; i < dcw; i++, pad++) data[i] = pad % 2 ? 0x11 : 0xec;
+
+  // --- split into blocks, add EC to each, interleave (data first, then EC)
+  const perBlk = Math.floor(dcw / nb);
+  const blocks = [], ecs = [];
+  for (let i = 0, off = 0; i < nb; i++){
+    const len = perBlk + (i >= g1 ? 1 : 0);
+    const blk = data.slice(off, off + len); off += len;
+    blocks.push(blk); ecs.push(qrRs(blk, ecLen));
+  }
+  const out = [];
+  for (let i = 0; i <= perBlk; i++) for (const b of blocks) if (i < b.length) out.push(b[i]);
+  for (let i = 0; i < ecLen; i++) for (const e of ecs) out.push(e[i]);
+
+  // --- the matrix: function patterns first, so data placement knows what to skip
+  const size = ver * 4 + 17;
+  const mod = [], fun = [];
+  for (let i = 0; i < size; i++){ mod.push(new Array(size).fill(0)); fun.push(new Array(size).fill(0)); }
+  const setF = (x, y, v) => { if (x >= 0 && y >= 0 && x < size && y < size){ mod[y][x] = v ? 1 : 0; fun[y][x] = 1; } };
+  // Finder + its separator in one pass: ring distance 0-1 and 3 are dark, 2 is the light ring,
+  // 4 is the separator.
+  const finder = (ox, oy) => {
+    for (let dy = -1; dy <= 7; dy++) for (let dx = -1; dx <= 7; dx++){
+      const d = Math.max(Math.abs(dx - 3), Math.abs(dy - 3));
+      setF(ox + dx, oy + dy, d !== 2 && d <= 3);
+    }
+  };
+  finder(0, 0); finder(size - 7, 0); finder(0, size - 7);
+  for (let i = 8; i < size - 8; i++){ setF(i, 6, i % 2 === 0); setF(6, i, i % 2 === 0); }
+  const al = QR_ALIGN[ver - 1];
+  for (const cy of al) for (const cx of al){
+    if ((cx === 6 && cy === 6) || (cx === 6 && cy === size - 7) || (cx === size - 7 && cy === 6)) continue;
+    for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++)
+      setF(cx + dx, cy + dy, Math.max(Math.abs(dx), Math.abs(dy)) !== 1);
+  }
+  // Format info: 5 data bits (ECC M = 00, then the mask) protected by BCH(15,5) over 0x537 and
+  // XORed with 0x5412 so an all-zero format can never look valid. Drawn twice.
+  const drawFormat = (mask) => {
+    const d5 = mask;                       // ECC M contributes 0 to the high two bits
+    let rem = d5;
+    for (let i = 0; i < 10; i++) rem = (rem << 1) ^ ((rem >>> 9) * 0x537);
+    const f = ((d5 << 10) | rem) ^ 0x5412;
+    const bit = (i) => (f >>> i) & 1;
+    for (let i = 0; i <= 5; i++) setF(8, i, bit(i));
+    setF(8, 7, bit(6)); setF(8, 8, bit(7)); setF(7, 8, bit(8));
+    for (let i = 9; i < 15; i++) setF(14 - i, 8, bit(i));
+    for (let i = 0; i < 8; i++) setF(size - 1 - i, 8, bit(i));
+    for (let i = 8; i < 15; i++) setF(8, size - 15 + i, bit(i));
+    setF(8, size - 8, 1);                  // the dark module, always
+  };
+  drawFormat(0);                           // reserve the cells; the real bits go in below
+  if (ver >= 7){
+    // Version info: 6 bits + BCH(18,6) over 0x1f25, in two 3x6 blocks by the finders.
+    let rem = ver;
+    for (let i = 0; i < 12; i++) rem = (rem << 1) ^ ((rem >>> 11) * 0x1f25);
+    const vbits = (ver << 12) | rem;
+    for (let i = 0; i < 18; i++){
+      const b = (vbits >>> i) & 1, a = size - 11 + i % 3, c = Math.floor(i / 3);
+      setF(a, c, b); setF(c, a, b);
+    }
+  }
+  // --- data: two columns at a time, bottom-right upward, zigzagging, skipping column 6
+  let bi = 0;
+  for (let right = size - 1; right >= 1; right -= 2){
+    if (right === 6) right = 5;
+    for (let vert = 0; vert < size; vert++){
+      for (let j = 0; j < 2; j++){
+        const x = right - j;
+        const y = (((right + 1) & 2) === 0) ? size - 1 - vert : vert;
+        if (!fun[y][x] && bi < out.length * 8){
+          mod[y][x] = (out[bi >>> 3] >>> (7 - (bi & 7))) & 1;
+          bi++;
+        }
+      }
+    }
+  }
+  // --- all eight masks, scored; keep the best. XOR is its own inverse, so each trial is undone
+  // by re-applying it.
+  let best = -1, bestP = Infinity;
+  for (let m = 0; m < 8; m++){
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) if (!fun[y][x] && QR_MASK[m](x, y)) mod[y][x] ^= 1;
+    drawFormat(m);
+    const p = qrPenalty(mod, size);
+    if (p < bestP) { bestP = p; best = m; }
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) if (!fun[y][x] && QR_MASK[m](x, y)) mod[y][x] ^= 1;
+  }
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) if (!fun[y][x] && QR_MASK[best](x, y)) mod[y][x] ^= 1;
+  drawFormat(best);
+  return { size, mod, ver, mask: best };
+}
+
+// One SVG path of horizontal runs, on a white rect that includes the 4-module quiet zone —
+// crisp at any size, no canvas, and nothing to load.
+function qrSvg(m){
+  const q = 4, total = m.size + q * 2;
+  let d = "";
+  for (let y = 0; y < m.size; y++){
+    let x = 0;
+    while (x < m.size){
+      if (!m.mod[y][x]) { x++; continue; }
+      let w = 1;
+      while (x + w < m.size && m.mod[y][x + w]) w++;
+      d += "M" + (x + q) + " " + (y + q) + "h" + w + "v1h-" + w + "z";
+      x += w;
+    }
+  }
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", "0 0 " + total + " " + total);
+  svg.setAttribute("shape-rendering", "crispEdges");
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", "短信二维码");
+  const bg = document.createElementNS(NS, "rect");
+  bg.setAttribute("width", String(total)); bg.setAttribute("height", String(total)); bg.setAttribute("fill", "#fff");
+  const path = document.createElementNS(NS, "path");
+  path.setAttribute("d", d); path.setAttribute("fill", "#000");
+  svg.append(bg, path);
+  return svg;
+}
+
+/* --- 短信指令: compose a signed SMS command, and hand the phone a QR of it -----------------
+   The same wire format main.lua verifies (sms_split / sms_signed) and luatos/sms-sign.sh
+   prints: "<body> <mac>", one space, no trailing whitespace, mac = the first 16 hex of
+   HMAC-SHA256 over "sms" + a newline + the body under SMS_KEY. Nothing is sent from here —
+   the point of the channel is that there may be nothing left to send to. */
+const smsDlg = document.getElementById("smsDlg");
+const smsToIn = document.getElementById("smsTo");
+const smsCmdSel = document.getElementById("smsCmdSel");
+const smsQrFmt = document.getElementById("smsQrFmt");
+try { const f = localStorage.getItem("sms_qr_fmt"); if (f) smsQrFmt.value = f; } catch {}
+const smsUrlIn = document.getElementById("smsUrl");
+const smsOtaFile = document.getElementById("smsOtaFile");
+const smsOtaLast = document.getElementById("smsOtaLast");
+const smsOtaNote = document.getElementById("smsOtaNote");
+const smsOut = document.getElementById("smsOut");
+const smsLine = document.getElementById("smsLine");
+const smsQr = document.getElementById("smsQr");
+const smsHint = document.getElementById("smsHint");
+let SMS_DEV = "";     // the module the dialog was opened for; "" = opened from the ⋯ menu
+let SMS_OTA = null;   // {name, hmac} once a script is staged — uploaded just now, or last time
+
+// Remembered per module: two modules are two SIMs. The bare key is the no-device case, which
+// is also the one that matters most — the card may be gone, that is why you are here.
+const smsToKey = (dev) => "sms_to:" + (dev || "");
+
+function smsCmdChanged(){
+  const k = smsCmdSel.value;
+  document.getElementById("smsUrlWrap").hidden = k !== "bases";
+  document.getElementById("smsOtaWrap").hidden = k !== "ota";
+  smsOut.hidden = true;                 // a stale line under a freshly changed command misleads
+}
+
+// 「用上次上传的」. An SMS "#ota" carries nothing but the file's hmac, so a script already
+// staged on the Worker needs no upload at all — but only if its hmac was stored with it.
+// Anything put there before /api/ota/put learned the param has none, and gets no shortcut.
+async function smsOtaShortcuts(){
+  smsOtaLast.textContent = "";
+  let meta = null;
+  try { const r = await fetch("/api/ota/meta", { cache: "no-store" }); if (r.ok) meta = await r.json(); } catch {}
+  if (!meta) return;
+  for (const name of ["gw", "gcm"]) {
+    const m = meta[name];
+    if (!m || !/^[0-9a-f]{64}$/i.test(String(m.hmac || ""))) continue;
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "out wide";
+    b.textContent = "用上次上传的 " + name + ".lua（" + m.size + " 字节）";
+    b.onclick = () => {
+      SMS_OTA = { name, hmac: String(m.hmac).toLowerCase() };
+      smsOtaNote.textContent = "用服务器上已有的 " + name + ".lua，签名 " + SMS_OTA.hmac.slice(0, 16) + "…";
+    };
+    smsOtaLast.append(b);
+  }
+}
+
+async function openSmsDlg(dev){
+  // The same refusal 更新脚本 gives: with no key nothing can be signed, and the module would
+  // ignore whatever this dialog produced.
+  if (!cryptoKey) { alert("请先点「密钥」填入 SMS_KEY —— 脚本要用它签名，模组才会接受。"); return; }
+  SMS_DEV = dev || "";
+  SMS_OTA = null;
+  let to = "";
+  try { to = localStorage.getItem(smsToKey(SMS_DEV)) || ""; } catch {}
+  // The module reports its own SIM number in the register blob when the firmware can read it
+  // off the card, so the common case is: open, pick, generate.
+  if (!to && SMS_DEV) to = String((DEVS.get(SMS_DEV) || {}).num || "");
+  if (!to) { try { to = localStorage.getItem(smsToKey("")) || ""; } catch {} }
+  smsToIn.value = to;
+  smsUrlIn.value = location.origin;
+  smsOtaFile.value = "";
+  smsOtaNote.textContent = "";
+  smsOtaLast.textContent = "";
+  smsQr.textContent = "";
+  smsCmdChanged();
+  smsDlg.showModal();
+  smsOtaShortcuts();                    // needs the Worker; the rest of the dialog does not
+}
+
+smsCmdSel.onchange = smsCmdChanged;
+document.getElementById("smsCmdBtn").onclick = () => openSmsDlg("");
+document.getElementById("smsClose").onclick = () => smsDlg.close();
+
+smsOtaFile.onchange = async () => {
+  const f = smsOtaFile.files[0];
+  if (!f) return;
+  // Which slot the file goes to comes from its name, exactly like the 更新脚本 flow.
+  const m = /^(gw|gcm)\\.lua$/i.exec(f.name);
+  if (!m) { smsOtaFile.value = ""; alert("文件名必须是 gw.lua 或 gcm.lua（决定替换模组上的哪个脚本）。"); return; }
+  const name = m[1].toLowerCase();
+  smsOtaNote.textContent = "上传中…";
+  try {
+    const bytes = await f.arrayBuffer();
+    const hmac = await hmacHex(name, bytes);
+    // The module still DOWNLOADS the script from the Worker — only the command travels by SMS —
+    // so the file has to be staged first. That is the one part of this flow the Worker is
+    // needed for, which is why 更新脚本 over SMS is for a broken module, not a broken server.
+    const r = await fetch("/api/ota/put?name=" + name + "&hmac=" + hmac, { method: "POST", body: bytes });
+    if (r.status === 401) { location.href = "/login"; return; }
+    if (!r.ok) { smsOtaNote.textContent = "上传失败：" + r.status + " " + (await r.text().catch(() => "")); return; }
+    SMS_OTA = { name, hmac };
+    smsOtaNote.textContent = name + ".lua 已上传（" + f.size + " 字节），模组会从 Worker 下载它。";
+    smsOtaShortcuts();
+  } catch (e) { smsOtaNote.textContent = "上传失败：" + (e && e.message ? e.message : e); }
+};
+
+document.getElementById("smsGo").onclick = async () => {
+  const kind = smsCmdSel.value;
+  let body = "";
+  if (kind === "status") body = "#status";
+  else if (kind === "reboot") body = "#reboot";
+  else if (kind === "reset") body = "#url reset";
+  else if (kind === "otaclear") body = "#ota clear";
+  else if (kind === "bases") {
+    // The rule 改域名 already uses, and the server's okUrl: https, host[:port][/path], nothing
+    // the module's "/api/…" join could trip over, trailing "/" dropped. Sign the NORMALISED
+    // list, because that is the value the module will store and compare against.
+    const list = smsUrlIn.value.split(",").map((s) => s.trim().replace(/\\/+$/, "")).filter(Boolean);
+    const okUrl = (s) => s.length <= 120 && /^https:\\/\\/[A-Za-z0-9.-]+(:[0-9]+)?(\\/[A-Za-z0-9._~\\/-]*)?$/.test(s);
+    if (!list.length || list.length > 5 || !list.every(okUrl)) {
+      alert("每个地址都要以 https:// 开头，只能是域名[:端口][/路径]（不能带 ?、# 或引号），最多 5 个，每个不超过 120 字符。"); return;
+    }
+    body = "#url " + list.join(",");
+  } else if (kind === "ota") {
+    if (!SMS_OTA) { alert("先选一个 gw.lua / gcm.lua 上传，或用上次上传的。"); return; }
+    body = "#ota " + SMS_OTA.name + " " + SMS_OTA.hmac;
+  }
+  let line;
+  try {
+    // hmacHex already signs "<name>" + a newline + the bytes, so the SMS domain tag is just
+    // the name "sms" — and the first 16 hex of it is the mac the device compares.
+    line = body + " " + (await hmacHex("sms", new TextEncoder().encode(body))).slice(0, 16);
+  } catch (e) { alert("签名失败：" + (e && e.message ? e.message : e)); return; }
+  smsLine.textContent = line;
+  try { localStorage.setItem(smsToKey(SMS_DEV), smsToIn.value.trim()); } catch {}
+  smsQr.textContent = "";
+  const to = norm(smsToIn.value);
+  let hint;
+  if (!to) {
+    hint = "没填号码，就只有上面这行 —— 复制它，从任何一部手机发给模组的 SIM 卡号即可。";
+  } else {
+    // No QR-to-SMS convention is universal: SMSTO: is the zxing one most scanner apps take,
+    // Android's own camera wants sms:<n>?body=, iOS sms:<n>&body=, and WeChat/Alipay understand
+    // none of them and hand the whole string over as text. Offer all four and let the phone that
+    // is actually in the room decide — the choice is remembered, so it is a one-time fiddle.
+    const fmt = smsQrFmt.value;
+    const payload =
+      fmt === "sms"    ? "sms:" + to + "?body=" + encodeURIComponent(line) :
+      fmt === "smsamp" ? "sms:" + to + "&body=" + encodeURIComponent(line) :
+      fmt === "text"   ? line :
+                         "SMSTO:" + to + ":" + line;
+    try { localStorage.setItem("sms_qr_fmt", fmt); } catch {}
+    const qr = qrEncode(payload);
+    if (qr) {
+      smsQr.append(qrSvg(qr));
+      hint = fmt === "text"
+        ? "扫出来的就是这行文字，复制到短信里发给模组即可（号码要自己填）。"
+        : "用手机扫码会打开短信编辑界面，号码和内容已填好，点发送即可。号码跑进了正文、或者扫不出来，就在上面换一个二维码格式。";
+    } else {
+      // Refused, never truncated: half a command with a good-looking mac is worse than none.
+      hint = "这行太长，二维码装不下（上限 213 字节）—— 复制上面那行自己发。";
+    }
+  }
+  // Same budget warning sms-sign.sh prints on stderr, at the same threshold (body + space + the
+  // 16-char mac, over 160). It still sends, but as a concatenated SMS the module has to reassemble
+  // — and on the break-glass channel a command that silently does nothing is the worst outcome.
+  if (line.length > 160) hint += "（这行 " + line.length + " 字，超过单条短信 160 字的额度：会被拆成多条发出，模组未必拼得回来 —— 能短就短。）";
+  smsHint.textContent = hint;
+  smsOut.hidden = false;
+};
+
+document.getElementById("smsCopy").onclick = async (e) => {
+  const b = e.currentTarget;
+  try {
+    await navigator.clipboard.writeText(smsLine.textContent);
+    b.textContent = "已复制";
+    setTimeout(() => { b.textContent = "复制"; }, 1200);
+  } catch {
+    // Same fallback as the verification-code copy: the clipboard needs a focused document and
+    // a secure context and is refused outright in some browsers. Select the line instead, so
+    // Cmd/Ctrl+C still works rather than leaving the tap looking broken.
+    const r = document.createRange();
+    r.selectNodeContents(smsLine);
+    const sel = getSelection();
+    sel.removeAllRanges();
+    sel.addRange(r);
+  }
+};
 
 // Pull-to-refresh, for the installed PWA where there is no browser chrome to pull on. Touch only,
 // and only when the page is already scrolled to the very top and no dialog is open — drag down past

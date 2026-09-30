@@ -50,6 +50,25 @@ echo "    database_id = $DB_ID"
 echo "==> 建表"
 $WR d1 execute sms --remote --file=schema.sql
 
+echo "==> 迁移（给已有的表补列）"
+# schema.sql only CREATEs IF NOT EXISTS, so a table that predates a column never gains it there.
+# SQLite has no ADD COLUMN IF NOT EXISTS; on a re-run the column already exists and the ALTER
+# fails with "duplicate column name" — that is the expected outcome, not an error. Anything else
+# (network, auth) is still fatal.
+migrate() {
+    local out
+    if out=$($WR d1 execute sms --remote --command "$1" 2>&1); then
+        echo "    + $1"
+    elif echo "$out" | grep -q "duplicate column name"; then
+        echo "    已有，跳过：$1"
+    else
+        echo "$out"
+        exit 1
+    fi
+}
+migrate "ALTER TABLE devices ADD COLUMN auth TEXT"
+migrate "ALTER TABLE devices ADD COLUMN status TEXT NOT NULL DEFAULT 'trusted'"
+
 echo "==> 设置密钥"
 # Secrets cannot be read back, so regenerating the token on every run would silently
 # invalidate the one already in local.properties. Only create what is missing.
@@ -89,14 +108,14 @@ fi
 # The encryption key is deliberately NOT a Worker secret — the server must never hold it.
 # It goes into the phone's local.properties and the browser's localStorage, nowhere else.
 KEYFILE=".sms_key"
-if [ -f "$KEYFILE" ]; then
-    SMS_KEY=$(cat "$KEYFILE")
-    echo "    加密密钥已存在（$KEYFILE），沿用"
+if [ -f "${KEYFILE}" ]; then
+    SMS_KEY=$(cat "${KEYFILE}")
+    echo "    加密密钥已存在（${KEYFILE}），沿用"
 else
     SMS_KEY=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-    echo "$SMS_KEY" > "$KEYFILE"
-    chmod 600 "$KEYFILE"
-    echo "    加密密钥已生成并存到 $KEYFILE（已 gitignore）"
+    echo "$SMS_KEY" > "${KEYFILE}"
+    chmod 600 "${KEYFILE}"
+    echo "    加密密钥已生成并存到 ${KEYFILE}（已 gitignore）"
 fi
 
 echo "==> 部署"
