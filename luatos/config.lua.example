@@ -26,6 +26,11 @@ return {
   -- 如需校验：把 Cloudflare 当前签发链的 CA（如 GTS WE1 + GTS Root R4）拼成一个多证书 PEM 放这里。
   -- CA_PEM = nil,
 
+  -- 可选。WebSocket 优先、HTTPS 兜底（README「WebSocket 优先」）。WS = false 只走 HTTPS；
+  -- 设了 CA_PEM 也只走 HTTPS（websocket 库不收 CA）。WS_PING_S 是保活 ping 间隔（秒，≥10）。
+  -- WS = true,
+  -- WS_PING_S = 60,
+
   -- 短信指令（#status / #reboot / #url / #ota）不需要配置，也关不掉：它们始终可用，
   -- 且始终要用上面这把 SMS_KEY 签名（见 luatos/sms-sign.sh 和 README §5）。
   -- 认的是签名不是号码，所以这里没有「主人手机号」这一项。

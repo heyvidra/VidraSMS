@@ -10,7 +10,7 @@
 -- authenticated with that same key — there is no phone number to configure.
 -- Needs nothing from gw.lua/gcm.lua at load time.
 PROJECT = "smsgw"
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 sys = require("sys")
 require("sysplus")
 

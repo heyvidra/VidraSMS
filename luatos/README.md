@@ -211,7 +211,7 @@ bash luatos/sms-sign.sh "$(bash luatos/test/ota-sign.sh gw)"    # → #ota gw <�
 
 | 指令 | 作用 |
 |---|---|
-| `#status` | 回一条：`2.1.0 csq=20 net=1 ip=10.x.x.x q=0 gcm=ok fw=V2052 trust=trusted ota=- boot=0 utc=14 win=fast`（信号 / 网络 / IP / 排队条数 / 加密自检 / 固件 / **信任状态** / OTA 副本 / 启动计数 / **模块看到的 UTC 小时** / **当前档位**）。`utc=` 和 `win=` 是判断 RTC 是否走偏的唯一手段 —— 时钟错了两个窗口一起平移，症状只有「有些天指令好像慢一点」。这行由 `gw.lua` 提供（`_G.gw_status_line`）；救援模式或 `gw.lua` 没起来时由 `main.lua` 自己回 `RESCUE boot_fail=… ota=… fw=… ver=… dev=…`。 |
+| `#status` | 回一条：`2.2.0 csq=20 net=1 ip=10.x.x.x q=0 gcm=ok fw=V2052 trust=trusted ota=- boot=0 ws=up utc=14 win=fast`（信号 / 网络 / IP / 排队条数 / 加密自检 / 固件 / **信任状态** / OTA 副本 / 启动计数 / **WebSocket 状态** / **模块看到的 UTC 小时** / **当前档位**）。`utc=` 和 `win=` 是判断 RTC 是否走偏的唯一手段 —— 时钟错了两个窗口一起平移，症状只有「有些天指令好像慢一点」。这行由 `gw.lua` 提供（`_G.gw_status_line`）；救援模式或 `gw.lua` 没起来时由 `main.lua` 自己回 `RESCUE boot_fail=… ota=… fw=… ver=… dev=…`。 |
 | `#reboot` | 重启（主动重启，清零计数，不回复）。 |
 | `#url https://a,https://b` | 等价于网页「改域名」：校验、存 fskv、回 `url ok rebooting`、5 秒后重启。整条短信已经用 `SMS_KEY` 签过了，所以这里不用再套一层网页那种 `bases` 签名。 |
 | `#url reset` | 清掉上面的覆盖和两个标记，回到 `config.lua` / 默认域名，重启（不回复）。 |
@@ -377,3 +377,26 @@ SIM 卡按 **200 MB/月** 设计。单次轮询实测约 **5.2 KB**（其中 TLS
 
 **收短信和未接来电完全不受排班影响** —— 它们是推送的，`enqueue()` 直接触发上传。排班只决定
 「你在网页上点发送 / 下指令之后多久生效」。急了就发一条签名 `#reboot`，重启后立刻轮询。
+
+### WebSocket 优先，HTTPS 兜底
+
+`gw.lua` 开一条 `wss://<base>/api/ws` 长连接（Worker 的 `class Hub`）。连着的时候，**所有请求**
+（注册、轮询、上报、ack）都原样塞进这条连接：同一个路由、同一个 bearer、同一套认领/ack 逻辑，
+只是不用每次重新握手。网页一点发送 / 下指令 / 点信任，Hub 立刻推一个 `poll`，模组几秒内就收到。
+连接断了、没回复、或 Hub 回 `c=0`（「这个走 HTTPS」）—— 同一个请求改走 HTTPS，排班回到上表。
+
+| 连接状态 | 轮询 | 估算流量 |
+|---|---|---|
+| 连着 | 每 5 分钟一次（`WS_POLL_MS`，只为保活检测和网页的「在线」），平时靠推送 | ping 约 13 MB/月（60 秒一次，`WS_PING_S` 可调）+ 重连和上报几 MB |
+| 断开 | 上表的 HTTPS 排班 | 约 96 MB/月（和以前一样） |
+
+**以上都还没在板子上测过**，是按帧大小估的。刷上之后要看的：`#status` 里的 `ws=up/down/off`、
+日志里 `ws up` / `ws down:` 多久一次（电信 NAT 多久回收空闲连接，决定 `WS_PING_S` 能不能放到 120）、
+一天后卡上实际用了多少流量。
+
+- 重连退避 30 秒起、翻倍到 30 分钟封顶；只有连满 10 分钟的连接才把退避重置回 30 秒 ——
+  连上就断的服务端不会变成每 30 秒一次握手。完全连不上时最多约 6.5 MB/月。
+- 配了 `CA_PEM` 就**不开** WebSocket：`websocket.create` 不收 CA，开了等于悄悄放弃你要的证书校验。
+  `config.lua` 里写 `WS = false` 也能手动关掉。
+- 模组收包缓冲在没有 PSRAM 的固件上只有 8 KB，超过就断线，所以 Hub 把回复切成 2000 字符一片。
+- `main.lua`（救援模式）只走 HTTPS，不受这里任何影响。

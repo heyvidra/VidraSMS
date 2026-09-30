@@ -5,7 +5,7 @@ pasted into a chat verbatim and read by someone who has never seen a dev board.
 **Part 2** is for the owner, remote, deciding what to do next from whatever came back.
 
 Board: 合宙 Air780EHV **核心板** (not the 开发板 — different button/LED layout).
-Firmware: `LuatOS-SoC_V2052_Air780EHV_101.soc`. Script: `smsgw` `2.1.0`.
+Firmware: `LuatOS-SoC_V2052_Air780EHV_101.soc`. Script: `smsgw` `2.2.0`.
 
 刷对了的话，开机第一屏必须同时满足这两条（缺一条就是刷错了变体或版本）：
 
@@ -97,7 +97,7 @@ then `#status` — never `#status` first on a 电信 SIM.
 
 | Line | Source |
 |---|---|
-| `boot smsgw 2.1.0 <rtos.version()> <rtos.bsp()>` | `gw.lua:723` `log.info("gw", "boot", _G.PROJECT, M.VERSION, ver, bsp)` |
+| `boot smsgw 2.2.0 <rtos.version()> <rtos.bsp()>` | `gw.lua:723` `log.info("gw", "boot", _G.PROJECT, M.VERSION, ver, bsp)` |
 | `gcm selftest ok` | `gw.lua:768` |
 | `SMS_KEY must be 64 hex chars — uploads disabled` | `gw.lua:757` |
 | `SMS_KEY is all zeros (unedited placeholder?) — uploads disabled` | `gw.lua:760` |
@@ -135,7 +135,7 @@ then `#status` — never `#status` first on a 电信 SIM.
 | `ota reverted after 3 failed boots` | `main.lua:433` |
 | `no poll answered in 15 min with OTA code active: failed boot, rebooting` | `main.lua:425` |
 
-**Healthy ordering:** `boot smsgw 2.1.0 …` → `gcm selftest ok` → `started dev=… bases 2 queue 0`
+**Healthy ordering:** `boot smsgw 2.2.0 …` → `gcm selftest ok` → `started dev=… bases 2 queue 0`
 → `registered: pending` → (after 信任) `trusted on the web`.
 
 **The one unmistakable shape:** a bad `SMS_KEY` returns from `main.lua` *before*
@@ -150,12 +150,12 @@ Signed with `bash luatos/sms-sign.sh '#status'`. Two possible shapes.
 Normal (`gw.lua:665-667`, `status_line()` published as `_G.gw_status_line`):
 
 ```
-2.1.0 csq=<n> net=<n> ip=<addr> q=<n> gcm=ok|FAIL fw=<rtos.version> trust=pending|trusted|blocked|? ota=<name|-> boot=<n>
+2.2.0 csq=<n> net=<n> ip=<addr> q=<n> gcm=ok|FAIL fw=<rtos.version> trust=pending|trusted|blocked|? ota=<name|-> boot=<n> ws=up|down|off utc=<hh> win=fast|slow
 ```
 
 | Field | Read it as |
 |---|---|
-| leading `2.1.0` | `M.VERSION` — the script version actually running |
+| leading `2.2.0` | `M.VERSION` — the script version actually running |
 | `csq=` | `mobile.csq()`; `-` means the call failed |
 | `net=` | `mobile.status()`; this is the network-registration number |
 | `ip=` | `socket.localIP()`; `-` = no data bearer |
@@ -170,7 +170,7 @@ Fallback (`main.lua:490-492`, used when `_G.gw_status_line` is absent — rescue
 or `gw.lua` died before publishing it):
 
 ```
-RESCUE boot_fail=<n> ota=<name|-> fw=<version> ver=2.1.0 dev=<16 hex>
+RESCUE boot_fail=<n> ota=<name|-> fw=<version> ver=2.2.0 dev=<16 hex>
 ```
 
 Receiving the `RESCUE …` shape at all is itself the finding: `gw.lua` is not running.
@@ -188,7 +188,7 @@ Receiving the `RESCUE …` shape at all is itself the finding: `gw.lua` is not r
 | **No card ever, and friend can borrow a Windows PC** | — | Part 1 steps 8–13. Read the `trace_*.txt` against 2.1. |
 | **`trace_*.txt` is empty** | In order of likelihood: `通用串口打印` ticked instead of **4G模块USB打印**; Luatools opened after boot (fix with **重启模块**); board is in BOOT mode (Device Manager shows exactly **1** port instead of 3–4 — vendor: *"如果出现了一个端口，则表示成功进入BOOT下载模式"*); another serial tool holding the port. | Walk through in that order. Only the BOOT-mode case needs the friend to touch the board (press `复位` alone, or OFF→ON). |
 | **`trace_*.txt` shows `config.lua missing/invalid (SMS_KEY must be 64 hex): nothing will run` every 60 s, nothing else** | The seller flashed a `config.lua` whose `SMS_KEY` is not 64 hex. `main.lua:555`. Nothing else is wrong. | Needs a reflash of `config.lua` — which needs the Windows PC anyway. Do not chase network or SIM. |
-| **`boot smsgw 2.1.0 …` present, `GCM SELF-TEST FAILED — uploads disabled`** | Crypto, not network. `gw.lua:770`. | Check the flashed firmware string on that same `boot` line against `LuatOS-SoC_V2052_Air780EHV_101.soc`. Wrong `.soc` is the first suspect. |
+| **`boot smsgw 2.2.0 …` present, `GCM SELF-TEST FAILED — uploads disabled`** | Crypto, not network. `gw.lua:770`. | Check the flashed firmware string on that same `boot` line against `LuatOS-SoC_V2052_Air780EHV_101.soc`. Wrong `.soc` is the first suspect. |
 | **`started dev=… bases 2 queue 0` present, no `registered:` line, repeated `register failed <code> <base>`** | On the module side everything works; the Worker is not answering 2xx. The code tells you which: `-1` = no network/DNS, `403`/`404` = the device row was 忘记'd, `5xx` = Worker. | Read the code. `-1` with `ip=-` in `#status` means no bearer, which on a fresh 电信 SIM usually means no APN attach yet — leave it 10 more minutes before touching anything. |
 | **`poll failed <n> times in a row; rebooting`** | `gw.lua:629`. Network outage or wrong bases. Note the counter is deliberately cleared unless an OTA copy is active, so this cannot walk a healthy module into rescue. | If it recurs with a good `csq=`, suspect the bases. `#url reset` (signed) drops any override. |
 | **`bases override unconfirmed, boot <n>/3`** | Someone set a `bases` override that has never answered a poll. Self-heals: after 3 boots `main.lua:245` reverts to the built-ins. | Wait for the revert; it is designed for exactly this. |

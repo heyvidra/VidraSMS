@@ -128,8 +128,8 @@ local function web_cmd(payload)
   return a and a.body, cmd_id
 end
 local function reg_json(sim, ls, ota, bootn)
-  return '{"n":"Air780EHV","s":[{"slot":0,"name":"' .. sim .. '"}],"t":"4G","os":"LuatOS V2050 Air780EHV","v":"2.1.0","ls":"' .. ls .. '"'
-    .. ',"imei":"861234567890123","iccid":"89860012345678901234","imsi":"460110123456789","num":"","fw":"V2050","ver":"2.1.0","ota":"' .. ota .. '","boot":' .. bootn .. '}'
+  return '{"n":"Air780EHV","s":[{"slot":0,"name":"' .. sim .. '"}],"t":"4G","os":"LuatOS V2050 Air780EHV","v":"2.2.0","ls":"' .. ls .. '"'
+    .. ',"imei":"861234567890123","iccid":"89860012345678901234","imsi":"460110123456789","num":"","fw":"V2050","ver":"2.2.0","ota":"' .. ota .. '","boot":' .. bootn .. '}'
 end
 
 -- =============================================================================
@@ -199,7 +199,7 @@ requests = {}
 fake.sms_incoming("10086", "您的验证码 1234")
 fake.tick(20000)
 eq("pending: queued, not uploaded", #require("gw")._state().queue .. " " .. #find(UPLOAD_PATH), "1 0")
-eq("signed #status while pending", sms_reply(PHONE, signed("#status")), "2.1.0 csq=20 net=1 ip=10.0.0.2 q=1 gcm=ok fw=V2050 trust=pending ota=- boot=1" .. winsuf())
+eq("signed #status while pending", sms_reply(PHONE, signed("#status")), "2.2.0 csq=20 net=1 ip=10.0.0.2 q=1 gcm=ok fw=V2050 trust=pending ota=- boot=1 ws=off" .. winsuf())
 status = "trusted"
 next_poll(); fake.tick(100)
 eq("trusted: upload", #find(UPLOAD_PATH), 1)
@@ -216,7 +216,7 @@ eq("unsigned #reboot gets no reply", sms_reply(OTHER, "#reboot"), nil)
 fake.tick(100)
 eq("unsigned #reboot forwarded as a normal SMS", #find(UPLOAD_PATH), 1)
 ok("unsigned #reboot did not reboot", not fake.rebooted)
-eq("signed #status line", sms_reply(PHONE, signed("#status")), "2.1.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=0" .. winsuf())
+eq("signed #status line", sms_reply(PHONE, signed("#status")), "2.2.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=0 ws=off" .. winsuf())
 -- An unsigned " #ota clear" is forwarded VERBATIM (leading space and all), never quietly
 -- swallowed: the user has to be able to see a probe on the web page.
 requests = {}
@@ -231,7 +231,7 @@ print("== 1b. the signature gate: only a valid mac executes, everything else is 
 -- over "sms\n<body>" under SMS_KEY is the whole credential. A message that does not
 -- verify is forwarded like any other SMS and NEVER answered: no oracle, no SMS spend,
 -- and the probe shows up on the web page where the user can see it.
-local LINE0 = "2.1.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=0" .. winsuf()
+local LINE0 = "2.2.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=0 ws=off" .. winsuf()
 requests = {}
 eq("a valid mac executes", sms_reply(PHONE, signed("#status")), LINE0)
 fake.tick(20000)
@@ -411,7 +411,7 @@ eq("gw.lua did not arm a second watchdog", _G.WDT_INIT_CALLS, 1)
 wdt.init = real_wdt_init
 ok("OTA gw registers + polls", #find("/api/register") == 1 and polls() >= 1)
 eq("register reports ota=gw, boot=1", gcm.open(key1raw, find("/api/register")[1].body), reg_json("SIM 1 · 中国电信", "", "gw", 1))
-eq("signed #status shows ota=gw", sms_reply(PHONE, signed("#status")), "2.1.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=gw boot=1" .. winsuf())
+eq("signed #status shows ota=gw", sms_reply(PHONE, signed("#status")), "2.2.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=gw boot=1 ws=off" .. winsuf())
 -- Broken copies (power loss mid-write) are removed at boot instead of lingering
 -- behind a misleading ota=gw. (5 min of answered polls between boots, so the
 -- boot-loop guard stays out of the picture.)
@@ -423,14 +423,14 @@ ok("truncated copy: removal logged", log_has("ota gw unusable, removed"))
 eq("truncated copy removed", ota_file("gw"), nil)
 eq("flashed gw runs", _G.GW_TAG, nil)
 ok("flashed gw polls", polls() >= 1)
-eq("signed #status no longer claims ota=gw", sms_reply(PHONE, signed("#status")), "2.1.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=1" .. winsuf())
+eq("signed #status no longer claims ota=gw", sms_reply(PHONE, signed("#status")), "2.2.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=1 ws=off" .. winsuf())
 fake.tick(310000)
 write_file(fake.fs_root .. "/ota_gcm.lua", "local x = 1\n")   -- compiles, returns nothing
 boot()
 fake.tick(10)
 ok("copy returning no module: removal logged", log_has("ota gcm unusable, removed"))
 eq("it is removed", ota_file("gcm"), nil)
-eq("flashed gcm in use", sms_reply(PHONE, signed("#status")), "2.1.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=1" .. winsuf())
+eq("flashed gcm in use", sms_reply(PHONE, signed("#status")), "2.2.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=1 ws=off" .. winsuf())
 
 -- =============================================================================
 print("== 3b. the same commands over signed SMS, in normal mode")
@@ -667,7 +667,7 @@ fake.sms_incoming(OTHER, "#status")
 fake.sms_incoming("10086", "ignored in rescue")
 fake.tick(100)
 eq("rescue: an unsigned #status is neither answered nor forwarded", #fake.sms_sent .. " " .. #find(UPLOAD_PATH), "0 0")
-eq("rescue: a signed #status falls back to main.lua's own line", sms_reply(PHONE, signed("#status")), "RESCUE boot_fail=3 ota=- fw=V2050 ver=2.1.0 dev=" .. dev())
+eq("rescue: a signed #status falls back to main.lua's own line", sms_reply(PHONE, signed("#status")), "RESCUE boot_fail=3 ota=- fw=V2050 ver=2.2.0 dev=" .. dev())
 fake.tick(150000)   -- 5 min up, polls answered → retry a normal boot
 ok("rescue: retries a normal boot after 5 min with answered polls", fake.rebooted)
 ok("rescue: retry logged", log_has("rescue: retrying a normal boot"))
@@ -778,7 +778,7 @@ do -- crypto.trng returns NOTHING on failure; indexing it would throw before sys
   fake.tick(60000)
   eq("no identity → nothing on the network", #requests, 0)
   ok("gw says so instead of crashing", log_has("no device identity"))
-  ok("main.lua still up: a signed #status is answered", (sms_reply(PHONE, signed("#status")) or ""):match("^2%.1%.0 csq=") ~= nil)
+  ok("main.lua still up: a signed #status is answered", (sms_reply(PHONE, signed("#status")) or ""):match("^2%.2%.0 csq=") ~= nil)
   crypto.trng = real_trng
 end
 do -- fskv cannot keep the identity (worn flash): main.lua hands it over in RAM

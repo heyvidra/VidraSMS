@@ -188,7 +188,7 @@ CREATED_DEV="$DEV"
 [ "$(kv "$OUT" BOOT_FAIL)" = "0" ] || fail "pending polls are answered → alive → boot_fail must clear after 5 min" "$OUT"
 [ "$(d1json "SELECT status FROM devices WHERE id='$DEV';" | node "$WORK/jget.js" status)" = "pending" ] || fail "D1 row not pending"
 pass "first boot: registered (dev=$DEV), D1 row pending, module polls and sees 'pending'; boot_fail cleared by answered polls"
-EXP_REG='{"n":"Air780EHV","s":[{"slot":0,"name":"SIM 1 · 中国电信"}],"t":"4G","os":"LuatOS V2050 Air780EHV","v":"2.1.0","ls":"","imei":"861234567890123","iccid":"89860012345678901234","imsi":"460110123456789","num":"","fw":"V2050","ver":"2.1.0","ota":"-","boot":1}'
+EXP_REG='{"n":"Air780EHV","s":[{"slot":0,"name":"SIM 1 · 中国电信"}],"t":"4G","os":"LuatOS V2050 Air780EHV","v":"2.2.0","ls":"","imei":"861234567890123","iccid":"89860012345678901234","imsi":"460110123456789","num":"","fw":"V2050","ver":"2.2.0","ota":"-","boot":1}'
 DINFO="$(d1json "SELECT info FROM devices WHERE id='$DEV';" | K="$KEY" node "$WORK/dec.js" info)"
 [ "$DINFO" = "$EXP_REG" ] || fail "register blob mismatch" "want: $EXP_REG"$'\n'"got:  $DINFO"
 pass "register blob decrypts to the exact self-description (imei/iccid/imsi/num/fw/ver/ota/boot present)"

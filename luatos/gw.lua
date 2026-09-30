@@ -13,7 +13,7 @@
 -- runtime (queue, uploader task, poller task, SMS/call callbacks), then M.start.
 --
 -- LuatOS globals used: sys, http, sms, fskv, mobile, crypto, log, rtos, json,
--- socket; optional (guarded): cc. `.wait()` calls only ever run inside
+-- socket; optional (guarded): cc, websocket. `.wait()` calls only ever run inside
 -- sys.taskInit tasks; timer callbacks never yield. From main.lua: _G.gw_reg
 -- (the registration JSON), _G.gw_cmd.run (web commands), _G.gw_ota.active (OTA
 -- state), _G.gw_alive (boot health) — guarded, so the helpers load standalone.
@@ -60,6 +60,18 @@ local FAST_TO_H = 22           -- exclusive, UTC
 local BOOT_FAST_MS = 600000    -- first 10 min of every boot: fast, whatever the clock says
 local WAIT_CHUNK_MS = 60000    -- slice long sleeps; a single 600 s sys.wait is unproven here
 local POLL_BACKOFF_MAX_MS = 900000
+-- WebSocket first, HTTPS as the fallback (see "WebSocket tunnel" below). None of these numbers has
+-- been measured on the board yet; they are the knobs to turn once it has.
+local WS_PING_S = 60           -- protocol ping, keeps the carrier's NAT mapping alive; cfg.WS_PING_S.
+                               -- ~13 MB/month at 60 s. The Hub answers it without waking (unbilled).
+local WS_POLL_MS = 300000      -- poll interval while the socket is up. Pokes carry the latency now;
+                               -- this is the liveness check (a dead socket is found within it) and
+                               -- the web's last-seen stamp (MODULE_ONLINE_MS is 45 min).
+local WS_CONNECT_MS = 20000
+local WS_RETRY_MS = 30000      -- reconnect backoff, doubling to the max. A handshake is ~4.5 KB, so
+local WS_RETRY_MAX_MS = 1800000  -- a socket that never works costs ≤48 tries/day ≈ 6.5 MB/month.
+local WS_STABLE_MS = 600000    -- only a socket that lived this long resets the backoff: one that
+                               -- drops right after connecting must not reconnect every 30 s.
 local PREFIX_AFTER_S = 120     -- Android: [原时间] only when uploaded ≥120 s after receipt
 local CLOCK_VALID_S = 1e9      -- os.time() below this = RTC not yet NITZ-synced
 
@@ -252,6 +264,22 @@ function M.parse_bases(v)
   return out
 end
 
+-- Tunnel frames (worker/src/index.js class Hub): one JSON line, "\n", then the raw body. The
+-- meta is built by hand so its bytes never depend on the firmware's json.encode.
+function M.ws_frame(i, method, path, auth, ctype, body)
+  return string.format('{"i":%d,"m":"%s","p":"%s","a":"%s","t":"%s"}\n', i, method,
+    M.json_escape(path), M.json_escape(auth), M.json_escape(ctype)) .. (body or "")
+end
+
+-- → meta table, body; nil when it is not a frame.
+function M.ws_parse(data)
+  if type(data) ~= "string" then return nil end
+  local nl = data:find("\n", 1, true)
+  local ok, m = pcall(json.decode, nl and data:sub(1, nl - 1) or data)
+  if not ok or type(m) ~= "table" then return nil end
+  return m, nl and data:sub(nl + 1) or ""
+end
+
 -- Attempt id like Android's newAttemptId(): SMS-yyyymmdd-<8 hex>.
 function M.new_attempt_id()
   local day, rnd = "00000000", "00000000"
@@ -280,6 +308,11 @@ local trusted = false     -- the web has trusted this device (uploads + sends al
 local trust = "?"         -- last status the Worker reported: pending | trusted | blocked | ?
 local serving             -- base that last answered a poll
 local reg_due = true      -- register at boot, every REGISTER_EVERY_MS, and after a trust change
+local ws_on = false       -- the socket task is running (firmware has websocket, no CA_PEM, WS ~= false)
+local ws, ws_base         -- the live client and the base it is connected to
+local ws_up = false       -- conack seen and nothing has failed since
+local ws_seq, ws_wait = 0, {}   -- tunnelled requests awaiting their reply: seq → {parts, got, code}
+local poke = false        -- the Hub said "poll" (or the socket just came up): poll without waiting
 
 _G.GCM_OK = false         -- read by #status; false disables every upload
 
@@ -319,11 +352,91 @@ local function auth_headers(ctype)
   return h
 end
 
+-- --- WebSocket tunnel (worker/src/index.js class Hub) -------------------------
+-- While the socket is up, http_req sends each request through it instead: same route, same
+-- bearer, same answer, minus the TLS handshake — and the Hub pokes us the moment a send or a
+-- command is queued. Every failure (no reply, socket down, the Hub answering c=0) falls through
+-- to the identical HTTPS request, so the socket can make things cheaper and faster, never break
+-- them. A request whose reply is lost may have run server-side: exactly the lost-HTTP-response
+-- case the claim/ack/ring logic already handles.
+
+local function ws_down(why)
+  if ws_up then log.warn("gw", "ws down:", why) end
+  ws_up = false
+  sys.publish("GW_WS", false)
+  for i in pairs(ws_wait) do sys.publish("GW_WS_" .. i) end   -- fall back to HTTPS now, not at the timeout
+end
+
+local function ws_recv(data)
+  local m, body = M.ws_parse(data)
+  if not m then return end
+  if m.t == "poll" then poke = true; sys.publish("GW_POLL"); return end
+  local i = math.tointeger(m.i)
+  local w = i and ws_wait[i]
+  if not w then return end   -- a late reply to a request that already went over HTTPS
+  w.parts[(math.tointeger(m.k) or 0) + 1] = body
+  w.got = w.got + 1
+  if w.got >= (math.tointeger(m.n) or 1) then
+    w.code = math.tointeger(m.c) or 0
+    sys.publish("GW_WS_" .. i)
+  end
+end
+
+-- → code, body; nil = no usable reply (the caller goes to HTTPS).
+local function ws_req(method, path, headers, body, timeout)
+  ws_seq = ws_seq + 1
+  local i = ws_seq
+  local w = { parts = {}, got = 0 }
+  ws_wait[i] = w
+  local sok, sent = pcall(ws.send, ws, M.ws_frame(i, method, path, headers["Authorization"], headers["Content-Type"], body))
+  if sok and sent ~= false then sys.waitUntil("GW_WS_" .. i, timeout) end
+  ws_wait[i] = nil
+  if w.code and w.code > 0 then return w.code, table.concat(w.parts) end
+  -- c=0 is the Hub declining (use HTTPS); silence is what a half-open TCP looks like: drop it.
+  if not w.code then ws_down(sok and "no reply to " .. path or "send failed") end
+  return nil
+end
+
+-- One connection, start to finish. Returns how long it was up (ms).
+local function ws_once(base)
+  local c = websocket.create(nil, (base:gsub("^http", "ws")) .. "/api/ws?dev=" .. dev_id, WS_PING_S)
+  if not c then log.warn("gw", "websocket.create failed"); return 0 end
+  ws, ws_base = c, base
+  c:headers({ Authorization = "Bearer " .. tostring(dev_secret) })
+  c:on(function(_, ev, data)
+    if ev == "conack" then
+      ws_up = true
+      log.info("gw", "ws up", base)
+      poke = true; sys.publish("GW_POLL")   -- catch up on whatever was queued while we were away
+      sys.publish("GW_WS", true)
+    elseif ev == "recv" then perr("ws recv", pcall(ws_recv, data))
+    elseif ev == "disconnect" or ev == "error" then ws_down(ev .. " " .. tostring(data))
+    end
+  end)
+  c:connect()
+  local lived = 0
+  local got, isup = sys.waitUntil("GW_WS", WS_CONNECT_MS)
+  if got and isup then
+    while ws_up do sys.waitUntil("GW_WS", WAIT_CHUNK_MS); lived = lived + WAIT_CHUNK_MS end
+  else
+    log.warn("gw", "ws connect failed", base)
+  end
+  ws_down("closing")
+  ws = nil
+  pcall(c.close, c)
+  return lived
+end
+
 -- http.request(...).wait() → code, headers, body. Negative codes = network
 -- failure (-4 connect, -8 timeout). A thrown error is mapped to -1 so callers
 -- only ever branch on a number. CA_PEM, when set, goes in as the 6th
--- positional argument and turns on VERIFY_REQUIRED.
+-- positional argument and turns on VERIFY_REQUIRED. Through the socket first
+-- when it is up and on this base.
 local function http_req(method, url, headers, body, timeout)
+  if ws_up and ws_base and url:sub(1, #ws_base + 1) == ws_base .. "/" then
+    local code, rbody = ws_req(method, url:sub(#ws_base + 1), headers or {}, body, timeout)
+    if code then return code, {}, rbody end
+  end
   local ok, code, hdrs, rbody = pcall(function()
     local r
     if cfg.CA_PEM then
@@ -700,14 +813,40 @@ local function poller()
     local iv = POLL_FAST_MS
     local sok, v = pcall(M.poll_interval, os.time(), up)
     if sok and type(v) == "number" and v >= 60000 then iv = v end
+    if ws_up then iv = WS_POLL_MS end   -- pokes carry the latency; a socket poll is a few hundred bytes
     if poll_fail > 0 then iv = math.min(iv * poll_fail, POLL_BACKOFF_MAX_MS) end
-    last_interval = iv
+    -- A poke (the Hub, or the socket coming up) cuts the sleep short. Each slice is counted in
+    -- full even when cut short — only the boot-fast window, the register tick and poll_fail_ms
+    -- read `up`, and all three err towards "sooner". The floor keeps a Hub that pokes in a loop
+    -- from turning into a poll loop.
     local slept = 0
-    while slept < iv do
+    while slept < iv and not poke do
       local chunk = math.min(WAIT_CHUNK_MS, iv - slept)
+      sys.waitUntil("GW_POLL", chunk); slept = slept + chunk
+    end
+    if slept == 0 then sys.wait(3000); slept = 3000 end
+    poke = false
+    last_interval = slept
+    up = up + slept
+  end
+end
+
+-- The socket's lifecycle: connect to the serving base, stay while it is up, back off, repeat.
+local function ws_link()
+  wait_ip()
+  local backoff = WS_RETRY_MS
+  while true do
+    -- pcall'd so a throw can only ever cost one attempt: the sleep below always runs, which is
+    -- what keeps a deterministic error from becoming a reconnect loop.
+    local ok, lived = pcall(ws_once, serving or bases[1])
+    perr("ws", ok, lived)
+    if ok and lived >= WS_STABLE_MS then backoff = WS_RETRY_MS end
+    local slept = 0
+    while slept < backoff do
+      local chunk = math.min(WAIT_CHUNK_MS, backoff - slept)
       sys.wait(chunk); slept = slept + chunk
     end
-    up = up + iv
+    backoff = math.min(backoff * 2, WS_RETRY_MAX_MS)
   end
 end
 
@@ -729,10 +868,10 @@ local function status_line()
   local hh = "-"
   if type(now) == "number" and now >= CLOCK_VALID_S then hh = safe(os.date, "!%H", math.floor(now)) end
   local iv = M.poll_interval(now, BOOT_FAST_MS)
-  return string.format("%s csq=%s net=%s ip=%s q=%d gcm=%s fw=%s trust=%s ota=%s boot=%d utc=%s win=%s",
+  return string.format("%s csq=%s net=%s ip=%s q=%d gcm=%s fw=%s trust=%s ota=%s boot=%d ws=%s utc=%s win=%s",
     tostring(M.VERSION), safe(mobile.csq), safe(mobile.status), ip, #queue,
     _G.GCM_OK and "ok" or "FAIL", safe(rtos.version), trust, ota, tonumber(kv_get("boot_fail")) or 0,
-    hh, iv == POLL_FAST_MS and "fast" or "slow")
+    ws_up and "up" or (ws_on and "down" or "off"), hh, iv == POLL_FAST_MS and "fast" or "slow")
 end
 
 -- Every message that reaches gw.lua is an ordinary message: main.lua's callback has
@@ -776,7 +915,7 @@ end
 function M._state()
   return { queue = queue, ring = ring, dev_id = dev_id, bases = bases, serving = serving,
            last_send = last_send, poll_fail = poll_fail, polls = polls, ringing = ringing,
-           trust = trust, trusted = trusted, started = started }
+           trust = trust, trusted = trusted, started = started, ws_up = ws_up, ws_on = ws_on }
 end
 
 -- ---------------------------------------------------------------------------
@@ -795,6 +934,8 @@ function M.start(c)
   elseif pm then log.error("gw", "POLL_MS " .. tostring(pm) .. " is below 10 s — ignoring it") end
   local pf = tonumber(cfg.POLL_FAIL_MS)
   if pf and pf >= 60000 then POLL_FAIL_MS = pf end
+  local wp = tonumber(cfg.WS_PING_S)
+  if wp and wp >= 10 then WS_PING_S = math.floor(wp) end
   M.VERSION = _G.VERSION or "0.0.0"
   local ver, bsp = "?", "?"
   pcall(function() ver = rtos.version(); bsp = rtos.bsp() end)
@@ -891,7 +1032,13 @@ function M.start(c)
   started = true
   forever("uploader", uploader)
   forever("poller", poller)
-  log.info("gw", "started dev=" .. dev_id, "bases", #bases, "queue", #queue)
+  -- websocket.create takes no CA, so a config that pins one (CA_PEM) stays HTTPS-only rather than
+  -- quietly giving up the check it asked for. WS = false in config.lua is the manual off switch.
+  if websocket and websocket.create and cfg.WS ~= false and not cfg.CA_PEM then
+    ws_on = true
+    forever("ws", ws_link)
+  end
+  log.info("gw", "started dev=" .. dev_id, "bases", #bases, "queue", #queue, "ws", ws_on)
   return M
 end
 

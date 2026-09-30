@@ -307,8 +307,8 @@ do
   eq("register bearer is the device secret", reg.headers["Authorization"], "Bearer " .. secret)
   eq("register content-type", reg.headers["Content-Type"], "text/plain; charset=utf-8")
   eq("register blob decrypts to the exact self-description", gcm.open(key32, reg.body),
-    '{"n":"Air780EHV","s":[{"slot":0,"name":"SIM 1 · 中国电信"}],"t":"4G","os":"LuatOS V2050 Air780EHV","v":"2.1.0","ls":""'
-    .. ',"imei":"861234567890123","iccid":"89860012345678901234","imsi":"460110123456789","num":"","fw":"V2050","ver":"2.1.0","ota":"-","boot":1}')
+    '{"n":"Air780EHV","s":[{"slot":0,"name":"SIM 1 · 中国电信"}],"t":"4G","os":"LuatOS V2050 Air780EHV","v":"2.2.0","ls":""'
+    .. ',"imei":"861234567890123","iccid":"89860012345678901234","imsi":"460110123456789","num":"","fw":"V2050","ver":"2.2.0","ota":"-","boot":1}')
   eq("poll url", find("/api/poll")[1].url, "https://x.test/api/poll?dev=" .. st.dev_id)
   eq("poll bearer", find("/api/poll")[1].headers["Authorization"], "Bearer " .. secret)
   eq("poll is a GET", find("/api/poll")[1].method, "GET")
@@ -321,7 +321,7 @@ do
   eq("pending: nothing uploaded", #find("/sms-t"), 0)
   eq("pending: no devinfo any more", #find("/api/devinfo"), 0)
   eq("signed #status while pending", (function() fake.sms_sent = {}; fake.sms_incoming(PHONE, signed("#status")); fake.tick(10); return fake.sms_sent[1] and fake.sms_sent[1].body end)(),
-    "2.1.0 csq=20 net=1 ip=10.0.0.2 q=1 gcm=ok fw=V2050 trust=pending ota=- boot=1" .. winsuf())
+    "2.2.0 csq=20 net=1 ip=10.0.0.2 q=1 gcm=ok fw=V2050 trust=pending ota=- boot=1 ws=off" .. winsuf())
 
   -- Trusted on the web: the next poll sees it → queue drains → re-register on the following cycle.
   status = "trusted"
@@ -363,7 +363,7 @@ do
   fake.tick(10)
   eq("signed command not uploaded", #find("/sms-t"), 0)
   eq("status reply sent", #fake.sms_sent, 1)
-  eq("status reply exact", fake.sms_sent[1].body, "2.1.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=1" .. winsuf())
+  eq("status reply exact", fake.sms_sent[1].body, "2.2.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=1 ws=off" .. winsuf())
   ok("the rich line is gw.lua's hook", type(_G.gw_status_line) == "function")
   eq("the hook is what answered", _G.gw_status_line(), fake.sms_sent[1].body)
   -- An UNSIGNED "#status" — from any number at all — is an ordinary message: gw.lua
@@ -621,7 +621,7 @@ do
   eq("OTA gw runs after the reboot", _G.GW_TAG, "ota")
   eq("register now reports ota=gw", gcm.open(key32, find("/api/register")[1].body):match('"ota":"gw"') ~= nil, true)
   eq("signed #status shows ota=gw", (function() fake.sms_sent = {}; fake.sms_incoming(PHONE, signed("#status")); fake.tick(10); return fake.sms_sent[1] and fake.sms_sent[1].body end)(),
-    "2.1.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=gw boot=1" .. winsuf())
+    "2.2.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=gw boot=1 ws=off" .. winsuf())
   _G.GW_TAG = nil
 
   -- ---- the web pressed 忘记: the devices row is gone --------------------------------
@@ -765,6 +765,120 @@ do
   end
   ok("the next poll goes straight to the serving base", first ~= nil and first:find("good.test", 1, true) ~= nil)
   eq("and pays for exactly one connection", polls_to("bad.test"), 0)
+  fake.http_mock = nil
+end
+
+-- =============================================================================
+print("== ws_frame / ws_parse")
+eq("frame: one JSON line, then the raw body",
+  gw.ws_frame(7, "POST", "/sms-t?dev=ab", "Bearer s", "text/plain; charset=utf-8", "v1:x\ny"),
+  '{"i":7,"m":"POST","p":"/sms-t?dev=ab","a":"Bearer s","t":"text/plain; charset=utf-8"}\nv1:x\ny')
+eq("frame: GET, no content type, no body",
+  gw.ws_frame(1, "GET", "/api/poll?dev=ab", "Bearer s", nil, nil),
+  '{"i":1,"m":"GET","p":"/api/poll?dev=ab","a":"Bearer s","t":""}\n')
+do
+  local m, b = gw.ws_parse('{"i":3,"c":200,"k":0,"n":1}\n{"status":"x"}\nmore')
+  eq("parse: status", m.c, 200)
+  eq("parse: body keeps its own newlines", b, '{"status":"x"}\nmore')
+  local p, pb = gw.ws_parse('{"t":"poll"}')
+  eq("parse: a poke has no body", p.t .. "|" .. pb, "poll|")
+  eq("parse: not a frame", gw.ws_parse("HTTP/1.1 403"), nil)
+end
+
+-- =============================================================================
+-- The socket is only ever a cheaper pipe for the same requests: up → everything goes through it
+-- and a poke polls at once; any failure → the identical request over HTTPS; down → HTTPS on the
+-- old schedule while reconnects back off.
+print("== websocket first, HTTPS as the fallback")
+do
+  local key_hex = ("00112233445566778899aabbccddeeff"):rep(2)
+  fake.http_mock = function(method, url)
+    if url:find("/api/register", 1, true) then return 200, {}, '{"status":"trusted"}' end
+    if url:find("/api/poll", 1, true) then return 200, {}, '{"status":"trusted","rows":[],"cmd":null}' end
+    if url:find("/sms%-t%?") then return 200, {}, "ok" end
+    return 404, {}, "not found"
+  end
+  local function https(sub) local n = 0; for _, r in ipairs(fake.http_log) do if r.url:find(sub, 1, true) then n = n + 1 end end; return n end
+  local function tunnelled(sub) local n = 0; for _, f in ipairs(fake.ws_log) do if f:find(sub, 1, true) then n = n + 1 end end; return n end
+  fake.ws_install()
+  fake.http_log = {}
+  fskv.clear()
+  fake.no_run = true
+  fake.config = { BASES = { "https://x.test" }, TOPIC = "sms-t", SMS_KEY = key_hex, NAME = "Air780EHV", POLL_MS = 30000 }
+  fake.reboot_cycle()
+  fake.tick(5000)
+  local rt = require("gw")
+  local st = rt._state()
+  ok("socket up", st.ws_up)
+  eq("one connection", fake.ws_connects, 1)
+  eq("to the base, as wss, with ?dev=", fake.ws_live.url, "wss://x.test/api/ws?dev=" .. st.dev_id)
+  eq("the poll's bearer on the upgrade", fake.ws_live.hdrs.Authorization, "Bearer " .. fskv.get("dev_secret"))
+  eq("60 s protocol ping", fake.ws_live.keepalive, 60)
+  ok("coming up pokes a poll through the tunnel", tunnelled("/api/poll?dev=" .. st.dev_id) >= 1)
+  ok("#status says ws=up", _G.gw_status_line():find(" ws=up ", 1, true) ~= nil)
+
+  local h0 = #fake.http_log
+  local t0 = tunnelled("/api/poll")
+  fake.tick(600000)
+  eq("no HTTPS at all while the socket is up", #fake.http_log, h0)
+  eq("polls every 5 min over it (not every 30 s)", tunnelled("/api/poll") - t0, 2)
+
+  local p0 = rt._state().polls
+  fake.ws_part = 7     -- the reply arrives in 7-byte pieces
+  fake.ws_push()
+  fake.tick(5000)
+  eq("a poke polls within seconds, pieces reassembled", rt._state().polls, p0 + 1)
+  fake.ws_part = 2000
+
+  fake.sms_incoming("10086", "via the socket")
+  fake.tick(2000)
+  eq("inbound SMS uploaded through the tunnel", tunnelled("/sms-t?dev="), 1)
+  ok("with its content type", fake.ws_log[#fake.ws_log]:find('"t":"text/plain; charset=utf-8"}\nv1:', 1, true) ~= nil)
+  eq("and not over HTTPS", https("/sms-t"), 0)
+  eq("queue drained", #rt._state().queue, 0)
+
+  fake.ws_decline = true
+  fake.sms_incoming("10086", "declined")
+  fake.tick(2000)
+  eq("Hub says c=0 → the same upload over HTTPS", https("/sms-t"), 1)
+  ok("a decline does not drop the socket", rt._state().ws_up)
+  fake.ws_decline = false
+
+  fake.ws_silent = true   -- half-open TCP: frames go out, nothing ever comes back
+  fake.sms_incoming("10086", "half-open")
+  fake.tick(12000)
+  eq("no reply within the timeout → HTTPS", https("/sms-t"), 2)
+  eq("nothing lost on the way", #rt._state().queue, 0)
+  ok("and the silent socket is dropped", not rt._state().ws_up)
+  fake.ws_silent = false
+  fake.tick(35000)
+  ok("reconnects after the 30 s backoff (it had been up > 10 min)", rt._state().ws_up)
+  eq("second connection", fake.ws_connects, 2)
+
+  fake.ws_refuse = true
+  local c0, hp0 = fake.ws_connects, https("/api/poll")
+  fake.ws_drop()
+  fake.tick(3600000)
+  local tries = fake.ws_connects - c0
+  ok("refused reconnects back off: " .. tries .. " tries in an hour", tries >= 4 and tries <= 6)
+  ok("HTTPS polls carry on meanwhile", https("/api/poll") - hp0 >= 60)
+  ok("#status says ws=down", _G.gw_status_line():find(" ws=down ", 1, true) ~= nil)
+  fake.ws_refuse = false
+
+  fake.config.CA_PEM = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+  fake.reboot_cycle()
+  c0 = fake.ws_connects
+  fake.tick(60000)
+  ok("CA_PEM set → HTTPS only (websocket.create cannot verify)", rt ~= require("gw") and not require("gw")._state().ws_on)
+  eq("no connection attempted", fake.ws_connects, c0)
+  fake.config.CA_PEM = nil
+  fake.config.WS = false
+  fake.reboot_cycle()
+  fake.tick(60000)
+  ok("WS = false → HTTPS only", not require("gw")._state().ws_on)
+  fake.config.WS = nil
+
+  fake.ws_uninstall()
   fake.http_mock = nil
 end
 

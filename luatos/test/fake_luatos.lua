@@ -642,4 +642,68 @@ do
   end
 end
 
+-- ---- websocket: opt-in (fake.ws_install), so every other test keeps the HTTPS-only path ------
+-- The "Hub" answers a tunnelled frame by calling fake.http_mock with the URL the request would
+-- have had over HTTPS, and sends the reply back in fake.ws_part-sized pieces, like index.js.
+-- Knobs: fake.ws_refuse (connect fails), fake.ws_silent (requests are swallowed), fake.ws_decline
+-- (Hub answers c=0). fake.ws_log records every frame the module sent; fake.ws_connects counts tries.
+function fake.ws_install()
+  fake.ws_log, fake.ws_connects, fake.ws_part = {}, 0, 2000
+  fake.ws_refuse, fake.ws_silent, fake.ws_decline, fake.ws_live = false, false, false, nil
+  websocket = {}
+  function websocket.create(_, url, keepalive)
+    local c = { url = url, keepalive = keepalive }
+    function c:headers(h) self.hdrs = h; return true end
+    function c:on(cb) self.cb = cb end
+    function c:connect()
+      fake.ws_connects = fake.ws_connects + 1
+      sys.timerStart(function()
+        if fake.ws_refuse then self.cb(self, "error", "connect"); return end
+        self.open = true; fake.ws_live = self
+        self.cb(self, "conack")
+      end, 10)
+      return true
+    end
+    function c:send(data)
+      if not self.open then return false end
+      fake.ws_log[#fake.ws_log + 1] = data
+      if fake.ws_silent then return true end
+      local nl = data:find("\n", 1, true)
+      local m = json.decode(data:sub(1, nl - 1))
+      local body = data:sub(nl + 1)
+      local code, resp = 0, ""
+      if not fake.ws_decline then
+        local base = self.url:match("^wss?://[^/]+"):gsub("^ws", "http")
+        local hdrs = { Authorization = m.a }
+        if m.t ~= "" then hdrs["Content-Type"] = m.t end
+        local c2, _, rb = fake.http_mock(m.m, base .. m.p, hdrs, m.m == "POST" and body or nil)
+        code, resp = c2, rb or ""
+      end
+      local parts, k = {}, 1
+      repeat parts[#parts + 1] = resp:sub(k, k + fake.ws_part - 1); k = k + fake.ws_part until k > #resp
+      sys.timerStart(function()
+        for n, p in ipairs(parts) do
+          if self.open then
+            self.cb(self, "recv", string.format('{"i":%d,"c":%d,"k":%d,"n":%d}\n', m.i, code, n - 1, #parts) .. p)
+          end
+        end
+      end, 10)
+      return true
+    end
+    function c:close() self.open = false; if fake.ws_live == self then fake.ws_live = nil end end
+    function c:ready() return self.open == true end
+    return c
+  end
+end
+function fake.ws_uninstall() websocket = nil end
+function fake.ws_push(s)
+  local c = fake.ws_live
+  if c then sys.timerStart(function() if c.open then c.cb(c, "recv", s or '{"t":"poll"}') end end, 1) end
+end
+-- The server end goes away (a Worker deploy, a NAT drop that surfaced as an RST).
+function fake.ws_drop()
+  local c = fake.ws_live
+  if c then c.open = false; fake.ws_live = nil; sys.timerStart(function() c.cb(c, "disconnect") end, 1) end
+end
+
 return fake

@@ -276,6 +276,19 @@ worker/test/device-registry.sh
 | D1 写入 | 100,000 行/天 | 每条短信 1 行 |
 | D1 读取 | 5,000,000 行/天 | 每次轮询几行 |
 | D1 存储 | 5 GB（单库 500 MB） | 一条短信约 200 字节 |
+| Durable Objects 请求 | 100,000 次/天 | 模组 WebSocket：每次连接 1 次，收到的消息 20 条折 1 次；模组的协议 ping 由平台直接回复，不计 |
+| Durable Objects 时长 | 13,000 GB-s/天 | 用 Hibernation API，空闲连接不计时长；就算常驻 24 小时也只要 10,800 GB-s |
+
+模组的 WebSocket（`class Hub`，见 [luatos/README.md](../luatos/README.md) 的「WebSocket 优先」）
+要 Durable Objects。免费版只有 SQLite 型的，`wrangler.toml` 里的 `[[migrations]]` 用的就是它；
+第一次 `wrangler deploy` 会自动建好，不用去控制台点。没部署它的话，模组连不上 WebSocket，
+自动退回 HTTPS 轮询，行为和以前一样。
+
+本地回归测试（Node 22 自带的 WebSocket 冒充模组：鉴权、隧道、分片、推送、重连）：
+
+```bash
+worker/test/ws-tunnel.sh
+```
 
 **超额是直接报错，不会自动扣钱** —— Workers 付费版要主动订阅，没绑卡就没有扣款途径。
 

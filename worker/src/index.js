@@ -7,6 +7,8 @@
 // Reading the messages is a normal cookie session: /login issues an HMAC-signed cookie,
 // every other read verifies it.
 
+import { DurableObject } from "cloudflare:workers";
+
 const PAGE_SIZE = 200;
 // How long a claimed-but-unacked outbox row may sit before another poll may take it again.
 // Longer than the 60s a send waits for its delivery report, plus room for a slow poll.
@@ -322,7 +324,7 @@ async function handleLogin(request, env) {
 
 /* ------------------------------------------------------------------- router */
 
-export default {
+const app = {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
@@ -409,6 +411,7 @@ export default {
       const dev = typeof b.dev === "string" && b.dev ? b.dev.slice(0, 64) : null;
       const r = await env.DB.prepare("INSERT INTO outbox (ts, payload, status, dev) VALUES (?, ?, 'pending', ?)")
         .bind(Date.now(), b.payload, dev).run();
+      ctx.waitUntil(poke(env, dev));
       return Response.json({ ok: true, id: r.meta?.last_row_id });
     }
     // Web reads its own outbox to show status.
@@ -567,6 +570,17 @@ export default {
       if (c) { try { cmd = Object.assign({ id: c.id }, JSON.parse(c.payload)); } catch {} }
       return Response.json({ status: "trusted", rows: claim.results || [], cmd });
     }
+    // The module's socket (see class Hub). Same credential as the poll. A pending module may hold
+    // one too, so clicking 信任 pokes it and it starts working at once. Blocked: refused, and the
+    // module backs off to HTTPS-only.
+    if (request.method === "GET" && path === "/api/ws") {
+      const a = await deviceAuth(request, env, url);
+      if (!a || a.legacy || a.status === "blocked") return new Response("forbidden", { status: 403 });
+      if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket" || !env.HUB) {
+        return new Response("upgrade required", { status: 426 });
+      }
+      return env.HUB.get(env.HUB.idFromName("hub")).fetch(new Request("https://hub/ws?dev=" + encodeURIComponent(a.dev), request));
+    }
     // Module reports how a command went. Scoped to its own dev so one module can't close
     // another's command.
     if (request.method === "POST" && path === "/api/cmd/ack") {
@@ -606,6 +620,7 @@ export default {
       const b = await request.json().catch(() => null);
       if (!b?.id || !DEV_STATUSES.has(b.status)) return new Response('{"error":"bad"}', { status: 400 });
       await env.DB.prepare("UPDATE devices SET status=? WHERE id=?").bind(b.status, String(b.id).slice(0, 64)).run();
+      ctx.waitUntil(poke(env, String(b.id).slice(0, 64)));   // a socket-holding module hears 信任/拉黑 now
       return Response.json({ ok: true });
     }
     // Queue a command for a module. One pending per device: a module runs a command and reboots,
@@ -657,6 +672,7 @@ export default {
       if (pend) return new Response('{"error":"pending"}', { status: 409, headers: { "Content-Type": "application/json" } });
       const r = await env.DB.prepare("INSERT INTO cmds (ts, dev, payload) VALUES (?, ?, ?)")
         .bind(Date.now(), dev, JSON.stringify(payload)).run();
+      ctx.waitUntil(poke(env, dev));
       return Response.json({ ok: true, id: r.meta?.last_row_id });
     }
     if (isRead && path === "/api/cmd/list") {
@@ -938,8 +954,103 @@ export default {
         .bind(now, k.payload, k.dev || null),
       env.DB.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('keepalive', ?)").bind(JSON.stringify(k)),
     ]);
+    ctx.waitUntil(poke(env, k.dev || null));
   },
 };
+export default app;
+
+/* ------------------------------------------------------------ module sockets */
+
+// A module keeps one WebSocket open to the Hub and sends every request it would have made over
+// HTTPS through it instead: the Hub rebuilds the Request and hands it to app.fetch — the same
+// routes, the same deviceAuth, the same claims and acks — so the socket is only a cheaper pipe,
+// never a second protocol. What it buys: no TLS handshake per request (3.6 KB of every 5.2 KB
+// poll), and a push: the moment a send or a command is queued the Hub tells the module to poll.
+// If the socket is down the module makes the identical request over HTTPS, so nothing here is
+// load-bearing for correctness.
+//
+// Frames, both directions: one JSON line, "\n", then the raw body.
+//   module → Hub  {"i":<seq>,"m":"GET|POST","p":"/api/poll?dev=…","a":"Bearer …","t":"<content-type>"}
+//   Hub → module  {"i":<seq>,"c":<status>,"k":<part>,"n":<parts>}   — the reply, in parts (c=0: use HTTPS)
+//                 {"t":"poll"}                                      — something is waiting for you
+// Parts, because the module's receive buffer is 8 KB on builds without PSRAM and a bigger frame
+// makes it drop the connection. A poll carrying two long outbox rows is already past that.
+const TUNNEL_PART = 2000;   // chars; ≤3 UTF-8 bytes each, so a part stays under 6 KB on the wire
+const TUNNEL_MAX_BODY = 8192;
+// Only what a module sends over HTTPS today. Everything else (the web, OTA downloads, phones)
+// never comes through here, so a socket can't reach a route its HTTPS twin couldn't.
+const tunnelable = (path, env) =>
+  ["/api/poll", "/api/register", "/api/outbox/ack", "/api/cmd/ack", "/" + env.TOPIC].includes(path);
+
+// Tells the module(s) to poll now. Best effort: a missed poke costs one poll interval, nothing more.
+async function poke(env, dev) {
+  if (!env.HUB) return;
+  try {
+    await env.HUB.get(env.HUB.idFromName("hub")).fetch("https://hub/poke?dev=" + encodeURIComponent(dev || ""));
+  } catch {}
+}
+
+// One object for every module: there are a handful, and one place means a poke for an unaddressed
+// row (dev IS NULL) reaches all of them. Hibernation API throughout — no timers, no in-memory
+// state — so an idle socket costs no duration, and the module's 60 s protocol pings are answered
+// by the platform without waking the object at all.
+export class Hub extends DurableObject {
+  async fetch(request) {
+    const url = new URL(request.url);
+    const dev = url.searchParams.get("dev") || "";
+    if (url.pathname === "/poke") {
+      const socks = dev ? this.ctx.getWebSockets(dev) : this.ctx.getWebSockets();
+      for (const ws of socks) { try { ws.send('{"t":"poll"}'); } catch {} }
+      return new Response(String(socks.length));
+    }
+    // One socket per module. A reconnect usually means the old TCP died without a FIN (a cellular
+    // NAT dropped it), so the old socket is still here and would swallow every poke.
+    for (const old of this.ctx.getWebSockets(dev)) { try { old.close(1000, "replaced"); } catch {} }
+    const [client, server] = Object.values(new WebSocketPair());
+    this.ctx.acceptWebSocket(server, [dev]);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async webSocketMessage(ws, msg) {
+    const s = typeof msg === "string" ? msg : new TextDecoder().decode(msg);
+    const nl = s.indexOf("\n");
+    let m;
+    try { m = JSON.parse(nl < 0 ? s : s.slice(0, nl)); } catch { return; }
+    if (!Number.isInteger(m?.i)) return;
+    const body = nl < 0 ? "" : s.slice(nl + 1);
+    // c=0 means "not through here, use HTTPS": a refusal the HTTPS route would not have given must
+    // not reach the module as a 4xx, which its uploader treats as permanent and drops the message.
+    let code = 0, text = "";
+    const u = new URL(String(m.p || ""), "https://tunnel.invalid");
+    // The tunnelled ?dev= must be the socket's own: the bearer is re-checked by the route anyway,
+    // this just keeps one module's socket from carrying another's traffic.
+    if ((m.m === "GET" || m.m === "POST") && tunnelable(u.pathname, this.env) &&
+        u.searchParams.get("dev") === this.ctx.getTags(ws)[0] && body.length <= TUNNEL_MAX_BODY) {
+      const headers = { Authorization: String(m.a || "") };
+      if (m.t) headers["Content-Type"] = String(m.t);
+      try {
+        const res = await app.fetch(new Request(u, { method: m.m, headers, body: m.m === "POST" ? body : undefined }), this.env, this.ctx);
+        code = res.status; text = await res.text();
+      } catch { code = 0; text = ""; }
+    }
+    const parts = [];
+    let k = 0;
+    do {
+      let e = Math.min(k + TUNNEL_PART, text.length);
+      if (e < text.length && /[\ud800-\udbff]/.test(text[e - 1])) e--;   // never split a surrogate pair
+      parts.push(text.slice(k, e));
+      k = e;
+    } while (k < text.length);
+    try {
+      parts.forEach((p, n) => ws.send(JSON.stringify({ i: m.i, c: code, k: n, n: parts.length }) + "\n" + p));
+    } catch {}   // the socket went away mid-request: the module times out and retries over HTTPS
+  }
+
+  // Before compatibility_date 2026-04-07 the runtime does not answer a client's close frame itself.
+  async webSocketClose(ws) {
+    try { ws.close(1000, "bye"); } catch {}
+  }
+}
 
 function html(body, status = 200) {
   // no-store: the app HTML/JS changes often and there is no build hash on it, so without this a
