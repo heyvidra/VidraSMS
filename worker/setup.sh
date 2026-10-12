@@ -7,6 +7,8 @@ set -euo pipefail
 cd "$(dirname "$0")"
 WR="npx wrangler"
 
+npm install --no-audit --no-fund --silent   # postal-mime, bundled into the Worker by wrangler
+
 echo "==> 登录 Cloudflare（浏览器会弹出授权页）"
 $WR whoami >/dev/null 2>&1 || $WR login
 

@@ -134,6 +134,27 @@ iOS 上任何浏览器都是 WebKit，普通网页收不到通知 —— 唯一�
 > **注：iOS 端到端投递我无法在这里实测**（需要真机）。VAPID 签名算法、各端点、Service Worker、
 > manifest 都已验证。若在 iPhone 上开不起来，把点「通知」后的报错发我，我按反馈调。
 
+## 2.9 收 Gmail 验证码（国内打不开 Gmail 时）
+
+Gmail 会自动转发到 `wrangler.toml` 里的 `MAIL_TO`（`code-<随机>@mail.777310753.xyz`）。
+Worker 收到后，会把邮件存成一条消息，和短信显示在同一个页面，发件人前面带 ✉，同样会推送。
+设备栏里有一张「✉ 邮件」卡片，点它只看邮件；选中某台设备时，邮件不会显示。
+用子域名 `mail.` 是为了不动主域名的 MX 记录。
+
+1. `./setup.sh` 部署一次（脚本会顺带执行 `npm install`，装上 `postal-mime`）。
+2. Cloudflare 控制台 → 777310753.xyz → **Email → Email Routing**：
+   - 添加子域名 `mail.777310753.xyz`，让它自动加 MX/SPF 记录。
+   - **Routing rules** 里加一条：Custom address 填 `MAIL_TO`，Action 选 **Send to a Worker** → `sms-forward`。
+   - Catch-all 保持关闭。
+3. 在能打开 Gmail 的地方（或者找人代操作）进 Gmail **设置 → 转发和 POP/IMAP → 添加转发地址**，填 `MAIL_TO`。
+   Google 发来的确认邮件会直接出现在你的页面上，把里面的确认码填回 Gmail 就行。
+4. 选“将收到的邮件转发到 …”。只想收验证码的话，可以改用过滤器
+   （例如 `验证码 OR code OR verification`）→ 转发到这个地址。
+
+邮件以**明文**存储，不走端到端加密：服务器没有 `SMS_KEY`，没法加密；Cloudflare 收信时本来也能看到明文。
+短信不受影响，照旧是加密存储。地址只要泄露了，就改 `MAIL_TO` 和对应的 Routing rule，
+发往其他地址的邮件一律拒收。本地测试：`test/email.sh`。
+
 ## 3. 安卓端不用改代码
 
 Worker 故意做成接受和之前完全一样的请求（`POST /<topic>`、`Authorization: Bearer`、
