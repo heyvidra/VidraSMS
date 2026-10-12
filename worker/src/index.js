@@ -8,6 +8,7 @@
 // every other read verifies it.
 
 import { DurableObject } from "cloudflare:workers";
+import PostalMime from "postal-mime";
 
 const PAGE_SIZE = 200;
 // How long a claimed-but-unacked outbox row may sit before another poll may take it again.
@@ -956,6 +957,28 @@ const app = {
     ]);
     ctx.waitUntil(poke(env, k.dev || null));
   },
+
+  // Email Routing → this Worker: Gmail auto-forwards here so its verification codes show up on
+  // the page from places Gmail itself can't be reached. Stored in plaintext (not v1:) on purpose:
+  // the server can't seal without SMS_KEY, and Cloudflare reads the mail on arrival anyway; the
+  // page and the service worker already show non-v1: bodies as-is.
+  async email(message, env, ctx) {
+    // The address is the gate, like TOPIC: a stray catch-all rule must not open the inbox to anyone.
+    if (!env.MAIL_TO || message.to.toLowerCase() !== env.MAIL_TO.toLowerCase()) {
+      message.setReject("unknown recipient");
+      return;
+    }
+    const m = await PostalMime.parse(message.raw);
+    // Codes live in the first lines; a full newsletter would only bury them. text is absent on
+    // HTML-only mail, so fall back to the HTML with the tags stripped.
+    const text = (m.text || (m.html || "").replace(/<style[\s\S]*?<\/style>|<[^>]+>/gi, " "))
+      .replace(/[ \t\u00a0]+/g, " ").replace(/\s*\n\s*/g, "\n").trim();
+    const body = ((m.subject ? m.subject + "\n" : "") + text).slice(0, 2000);
+    const sender = m.from?.name || m.from?.address || message.from;
+    await env.DB.prepare("INSERT INTO messages (ts, sender, body) VALUES (?, ?, ?)")
+      .bind(Date.now(), "✉ " + sender, body || "(空邮件)").run();
+    ctx.waitUntil(pushAll(env));
+  },
 };
 export default app;
 
@@ -1829,6 +1852,9 @@ async function render(rows, fresh){
     const li = document.createElement("li");
     if (fresh) li.className = "fresh";
     li.dataset.dev = plain?.dev || "";   // what the global device filter matches on
+    // Forwarded mail (email() stores it plaintext, sender "✉ …") belongs to no device; it is
+    // filed under the 邮件 card instead.
+    if (!msg.body.startsWith("v1:") && msg.sender.startsWith("✉ ")) li.dataset.mail = "1";
 
     const meta = document.createElement("div"); meta.className = "meta";
     const who = document.createElement("span"); who.className = "who";
@@ -1985,6 +2011,8 @@ let lastOutSig = null;    // same, for the outbox status strip
 // it — the message list and the default send target — which is the only way to answer "is THIS
 // phone working" once more than one is reporting.
 let ACTIVE_DEV = null;
+// The 邮件 card filters like a device does; this id can never collide with a real one (hex/random).
+const MAIL_DEV = "@mail";
 try { ACTIVE_DEV = localStorage.getItem("activeDev") || null; } catch {}
 
 function setActiveDev(id){
@@ -2006,7 +2034,7 @@ function applyDevFilter(){
     if (li.classList.contains("empty")) continue;
     total++;
     const d = li.dataset.dev || "";
-    const vis = !ACTIVE_DEV || d === ACTIVE_DEV;
+    const vis = !ACTIVE_DEV || (ACTIVE_DEV === MAIL_DEV ? li.dataset.mail === "1" : d === ACTIVE_DEV);
     li.style.display = vis ? "" : "none";
     if (vis) shown++;
   }
@@ -2015,7 +2043,8 @@ function applyDevFilter(){
   if (ACTIVE_DEV && total && !shown) {
     const note = document.createElement("li");
     note.className = "empty filternote";
-    note.textContent = "这台设备下没有消息（其余 " + total + " 条属于别的设备或更早的版本）";
+    note.textContent = ACTIVE_DEV === MAIL_DEV ? "还没有转发来的邮件"
+      : "这台设备下没有消息（其余 " + total + " 条属于别的设备或更早的版本）";
     list.prepend(note);
   }
 }
@@ -2208,15 +2237,28 @@ async function renderBeat(){
   // A filter you cannot clear is a trap: the 全部 chip used to appear only with two or more
   // phones, so after forgetting one (or reinstalling) a persisted ACTIVE_DEV silently hid every
   // untagged and undecryptable message with no way back. Offer it whenever a filter is active.
-  if (ACTIVE_DEV && !DEVS.has(ACTIVE_DEV)) { ACTIVE_DEV = null; try { localStorage.removeItem("activeDev"); } catch {} }
-  if (DEVS.size > 1 || ACTIVE_DEV) {
+  if (ACTIVE_DEV && ACTIVE_DEV !== MAIL_DEV && !DEVS.has(ACTIVE_DEV)) { ACTIVE_DEV = null; try { localStorage.removeItem("activeDev"); } catch {} }
+  {   // always: the 邮件 card below means there is always more than one thing to pick from
     const all = document.createElement("div");
     all.className = ACTIVE_DEV ? "dev-all" : "dev-all on";
     all.textContent = "全部";
-    all.title = "显示所有设备的消息";
+    all.title = "显示所有设备和邮件的消息";
     all.onclick = () => { ACTIVE_DEV = null; try { localStorage.removeItem("activeDev"); } catch {} ; renderBeat(); applyDevFilter(); };
     beatEl.append(all);
   }
+  // Gmail-forwarded mail (email() handler) as its own card, so it can be viewed on its own.
+  const mail = document.createElement("div");
+  mail.className = ACTIVE_DEV === MAIL_DEV ? "dev on" : "dev";
+  mail.title = ACTIVE_DEV === MAIL_DEV ? "再点一次显示全部" : "只看转发来的邮件";
+  mail.onclick = () => setActiveDev(MAIL_DEV);
+  const mtop = document.createElement("div"); mtop.className = "dev-top";
+  const mname = document.createElement("span"); mname.className = "dev-name"; mname.textContent = "✉ 邮件";
+  mtop.append(mname);
+  const msub = document.createElement("div"); msub.className = "dev-sub";
+  const mline = document.createElement("div"); mline.className = "dev-sims"; mline.textContent = "Gmail 转发";
+  msub.append(mline);
+  mail.append(mtop, msub);
+  beatEl.append(mail);
   for (const d of DEVS.values()) {
     const age = Date.now() - d.ts;
     const on = age < (d.module ? MODULE_ONLINE_MS : ONLINE_MS);
@@ -2650,7 +2692,7 @@ async function fillSim(sel){
   sel.textContent = "";
   sel.append(new Option(DEVS.size > 1 ? "默认（任意手机的默认卡）" : "默认卡", ""));
   for (const d of DEVS.values()) {
-    if (ACTIVE_DEV && d.id !== ACTIVE_DEV) continue;   // page is filtered to one phone
+    if (ACTIVE_DEV && ACTIVE_DEV !== MAIL_DEV && d.id !== ACTIVE_DEV) continue;   // page is filtered to one phone
     // A pending/blocked module can't claim a send; offering its SIM would just park the row.
     if (d.status && d.status !== "trusted") continue;
     if (d.sims.length) {
@@ -2666,7 +2708,7 @@ async function fillSim(sel){
     }
   }
   // With the page pinned to one phone, "任意手机" is never what you want — preselect that phone.
-  if (ACTIVE_DEV && sel.options.length > 1) sel.selectedIndex = 1;
+  if (ACTIVE_DEV && ACTIVE_DEV !== MAIL_DEV && sel.options.length > 1) sel.selectedIndex = 1;
 }
 
 // "<deviceId>|<slot>" -> {dev, sim} for postSend. Empty string means "no preference".

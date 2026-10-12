@@ -1,0 +1,6 @@
+{
+  "private": true,
+  "dependencies": {
+    "postal-mime": "2.7.6"
+  }
+}

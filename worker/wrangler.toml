@@ -16,6 +16,9 @@ routes = [
 TOPIC = "sms-7f3a9c2b1e0d"
 VAPID_PUBLIC = "BB_SGZKhZ5juUJeP1WGi5oDu7Sc9juXpthw3ikLIOg1lN63VrKksyGw3U5eN_8VGOCmPk8Dew2whRcLbpI6am2g"
 VAPID_SUBJECT = "mailto:admin@777310753.xyz"
+# Gmail forwards to this address (Email Routing on mail.777310753.xyz → Send to Worker). The random
+# part is the only gate, like TOPIC: mail to any other address is rejected. Change it if it leaks.
+MAIL_TO = "code-4ec3ee4ed9@mail.777310753.xyz"
 
 [[d1_databases]]
 binding = "DB"
