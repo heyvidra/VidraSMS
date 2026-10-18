@@ -812,7 +812,8 @@ do
   ok("socket up", st.ws_up)
   eq("one connection", fake.ws_connects, 1)
   eq("to the base, as wss, with ?dev=", fake.ws_live.url, "wss://x.test/api/ws?dev=" .. st.dev_id)
-  eq("the poll's bearer on the upgrade", fake.ws_live.hdrs.Authorization, "Bearer " .. fskv.get("dev_secret"))
+  eq("the poll's bearer on the upgrade, exactly as the Worker parses it", fake.ws_live.hdrs,
+    "Authorization: Bearer " .. fskv.get("dev_secret") .. "\r\n")
   eq("60 s protocol ping", fake.ws_live.keepalive, 60)
   ok("coming up pokes a poll through the tunnel", tunnelled("/api/poll?dev=" .. st.dev_id) >= 1)
   ok("#status says ws=up", _G.gw_status_line():find(" ws=up ", 1, true) ~= nil)
