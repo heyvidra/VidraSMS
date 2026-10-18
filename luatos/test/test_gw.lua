@@ -320,7 +320,7 @@ do
   eq("pending: message queued", #rt._state().queue, 1)
   eq("pending: nothing uploaded", #find("/sms-t"), 0)
   eq("pending: no devinfo any more", #find("/api/devinfo"), 0)
-  eq("signed #status while pending", (function() fake.sms_sent = {}; fake.sms_incoming(PHONE, signed("#status")); fake.tick(10); return fake.sms_sent[1] and fake.sms_sent[1].body end)(),
+  eq("signed #status while pending", (function() fake.sms_sent = {}; fake.sms_incoming(PHONE, signed("#status")); fake.tick(10); return fake.sms_sent[1] and (fake.sms_sent[1].body:gsub(" tx=%S+ rx=%S+ up=%S+$", "")) end)(),
     "2.2.0 csq=20 net=1 ip=10.0.0.2 q=1 gcm=ok fw=V2050 trust=pending ota=- boot=1 ws=off" .. winsuf())
 
   -- Trusted on the web: the next poll sees it → queue drains → re-register on the following cycle.
@@ -363,7 +363,7 @@ do
   fake.tick(10)
   eq("signed command not uploaded", #find("/sms-t"), 0)
   eq("status reply sent", #fake.sms_sent, 1)
-  eq("status reply exact", fake.sms_sent[1].body, "2.2.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=1 ws=off" .. winsuf())
+  eq("status reply exact", (fake.sms_sent[1].body:gsub(" tx=%S+ rx=%S+ up=%S+$", "")), "2.2.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=- boot=1 ws=off" .. winsuf())
   ok("the rich line is gw.lua's hook", type(_G.gw_status_line) == "function")
   eq("the hook is what answered", _G.gw_status_line(), fake.sms_sent[1].body)
   -- An UNSIGNED "#status" — from any number at all — is an ordinary message: gw.lua
@@ -620,7 +620,7 @@ do
   fake.tick(10)
   eq("OTA gw runs after the reboot", _G.GW_TAG, "ota")
   eq("register now reports ota=gw", gcm.open(key32, find("/api/register")[1].body):match('"ota":"gw"') ~= nil, true)
-  eq("signed #status shows ota=gw", (function() fake.sms_sent = {}; fake.sms_incoming(PHONE, signed("#status")); fake.tick(10); return fake.sms_sent[1] and fake.sms_sent[1].body end)(),
+  eq("signed #status shows ota=gw", (function() fake.sms_sent = {}; fake.sms_incoming(PHONE, signed("#status")); fake.tick(10); return fake.sms_sent[1] and (fake.sms_sent[1].body:gsub(" tx=%S+ rx=%S+ up=%S+$", "")) end)(),
     "2.2.0 csq=20 net=1 ip=10.0.0.2 q=0 gcm=ok fw=V2050 trust=trusted ota=gw boot=1 ws=off" .. winsuf())
   _G.GW_TAG = nil
 
@@ -817,6 +817,9 @@ do
   eq("60 s protocol ping", fake.ws_live.keepalive, 60)
   ok("coming up pokes a poll through the tunnel", tunnelled("/api/poll?dev=" .. st.dev_id) >= 1)
   ok("#status says ws=up", _G.gw_status_line():find(" ws=up ", 1, true) ~= nil)
+  fake.tick(120000)
+  eq("#status ends with the modem's own byte count and minutes up (GB part folded in)",
+    _G.gw_status_line():match(" tx=.*$"), " tx=1048588K rx=66K up=2m")
 
   local h0 = #fake.http_log
   local t0 = tunnelled("/api/poll")

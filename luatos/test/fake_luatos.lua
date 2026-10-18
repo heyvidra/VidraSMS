@@ -506,6 +506,8 @@ mobile = {
   syncTime = function() return true end,
   ipv6 = function() return false end,
   scell = function() return { mcc = 460, mnc = 11 } end,
+  -- uplink GB, B, downlink GB, B since boot (the firmware's order); 1 GB + 12345 B up.
+  dataTraffic = function() return 1, 12345, 0, 67890 end,
 }
 rtos = {
   version = function() return "V2050" end,

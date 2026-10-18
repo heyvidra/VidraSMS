@@ -115,7 +115,9 @@ local function sms_reply(from, text)
   fake.sms_sent = {}
   fake.sms_incoming(from, text)
   fake.tick(100)
-  return last_sms()
+  -- tx=/rx=/up= move with time and traffic; the exact-line asserts compare everything before them.
+  local r = last_sms()
+  return r and (r:gsub(" tx=%S+ rx=%S+ up=%S+$", ""))
 end
 -- Queue a web command for the next poll and run it; returns the ack body.
 local function web_cmd(payload)

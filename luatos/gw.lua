@@ -313,6 +313,7 @@ local ws, ws_base         -- the live client and the base it is connected to
 local ws_up = false       -- conack seen and nothing has failed since
 local ws_seq, ws_wait = 0, {}   -- tunnelled requests awaiting their reply: seq → {parts, got, code}
 local poke = false        -- the Hub said "poll" (or the socket just came up): poll without waiting
+local up_min = 0          -- minutes since M.start, for #status's traffic rate
 
 _G.GCM_OK = false         -- read by #status; false disables every upload
 
@@ -871,10 +872,22 @@ local function status_line()
   local hh = "-"
   if type(now) == "number" and now >= CLOCK_VALID_S then hh = safe(os.date, "!%H", math.floor(now)) end
   local iv = M.poll_interval(now, BOOT_FAST_MS)
-  return string.format("%s csq=%s net=%s ip=%s q=%d gcm=%s fw=%s trust=%s ota=%s boot=%d ws=%s utc=%s win=%s",
+  -- tx/rx: the modem's own byte count since boot (mobile.dataTraffic, zeroed by a reboot), with
+  -- up= minutes beside it, so KB per hour can be read off one reply instead of guessed from the
+  -- carrier's monthly total. "-" on firmware without the call.
+  local tx, rx = "-", "-"
+  pcall(function()
+    local ug, ub, dg, db = mobile.dataTraffic()
+    if type(ub) == "number" and type(db) == "number" then
+      tx = tostring(((ug or 0) * 1073741824 + ub) // 1024)
+      rx = tostring(((dg or 0) * 1073741824 + db) // 1024)
+    end
+  end)
+  return string.format("%s csq=%s net=%s ip=%s q=%d gcm=%s fw=%s trust=%s ota=%s boot=%d ws=%s utc=%s win=%s tx=%sK rx=%sK up=%dm",
     tostring(M.VERSION), safe(mobile.csq), safe(mobile.status), ip, #queue,
     _G.GCM_OK and "ok" or "FAIL", safe(rtos.version), trust, ota, tonumber(kv_get("boot_fail")) or 0,
-    ws_up and "up" or (ws_on and "down" or "off"), hh, iv == POLL_FAST_MS and "fast" or "slow")
+    ws_up and "up" or (ws_on and "down" or "off"), hh, iv == POLL_FAST_MS and "fast" or "slow",
+    tx, rx, up_min)
 end
 
 -- Every message that reaches gw.lua is an ordinary message: main.lua's callback has
@@ -1002,6 +1015,7 @@ function M.start(c)
   -- dormant gw.lua (no key/identity/base) still answers with what it knows rather than
   -- main.lua's bare RESCUE line.
   _G.gw_status_line = status_line
+  sys.timerLoopStart(function() up_min = up_min + 1 end, 60000)
 
   sms.setNewSmsCb(function(num, txt, metas)
     perr("sms cb", pcall(on_sms, num, txt, metas))

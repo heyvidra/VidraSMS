@@ -151,7 +151,7 @@ Signed with `bash luatos/sms-sign.sh '#status'`. Two possible shapes.
 Normal (`gw.lua:665-667`, `status_line()` published as `_G.gw_status_line`):
 
 ```
-2.2.0 csq=<n> net=<n> ip=<addr> q=<n> gcm=ok|FAIL fw=<rtos.version> trust=pending|trusted|blocked|? ota=<name|-> boot=<n> ws=up|down|off utc=<hh> win=fast|slow
+2.2.0 csq=<n> net=<n> ip=<addr> q=<n> gcm=ok|FAIL fw=<rtos.version> trust=pending|trusted|blocked|? ota=<name|-> boot=<n> ws=up|down|off utc=<hh> win=fast|slow tx=<KB>K rx=<KB>K up=<min>m
 ```
 
 | Field | Read it as |

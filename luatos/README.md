@@ -217,7 +217,7 @@ bash luatos/sms-sign.sh "$(bash luatos/test/ota-sign.sh gw)"    # → #ota gw <�
 
 | 指令 | 作用 |
 |---|---|
-| `#status` | 回一条：`2.2.0 csq=20 net=1 ip=10.x.x.x q=0 gcm=ok fw=V2054 trust=trusted ota=- boot=0 ws=up utc=14 win=fast`（信号 / 网络 / IP / 排队条数 / 加密自检 / 固件 / **信任状态** / OTA 副本 / 启动计数 / **WebSocket 状态** / **模块看到的 UTC 小时** / **当前档位**）。`utc=` 和 `win=` 是判断 RTC 是否走偏的唯一手段 —— 时钟错了两个窗口一起平移，症状只有「有些天指令好像慢一点」。这行由 `gw.lua` 提供（`_G.gw_status_line`）；救援模式或 `gw.lua` 没起来时由 `main.lua` 自己回 `RESCUE boot_fail=… ota=… fw=… ver=… dev=…`。 |
+| `#status` | 回一条：`2.2.0 csq=20 net=1 ip=10.x.x.x q=0 gcm=ok fw=V2054 trust=trusted ota=- boot=0 ws=up utc=14 win=fast tx=310K rx=420K up=1440m`（信号 / 网络 / IP / 排队条数 / 加密自检 / 固件 / **信任状态** / OTA 副本 / 启动计数 / **WebSocket 状态** / **模块看到的 UTC 小时** / **当前档位** / **开机以来模组自己统计的上行、下行流量和运行分钟数**）。用 `(tx+rx) ÷ up × 43200` 就是按当前速度一个月的 KB 数，比运营商的月累计准：它只算这块板子、这次开机。`utc=` 和 `win=` 是判断 RTC 是否走偏的唯一手段 —— 时钟错了两个窗口一起平移，症状只有「有些天指令好像慢一点」。这行由 `gw.lua` 提供（`_G.gw_status_line`）；救援模式或 `gw.lua` 没起来时由 `main.lua` 自己回 `RESCUE boot_fail=… ota=… fw=… ver=… dev=…`。 |
 | `#reboot` | 重启（主动重启，清零计数，不回复）。 |
 | `#url https://a,https://b` | 等价于网页「改域名」：校验、存 fskv、回 `url ok rebooting`、5 秒后重启。整条短信已经用 `SMS_KEY` 签过了，所以这里不用再套一层网页那种 `bases` 签名。 |
 | `#url reset` | 清掉上面的覆盖和两个标记，回到 `config.lua` / 默认域名，重启（不回复）。 |
