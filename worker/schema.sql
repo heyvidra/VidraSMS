@@ -57,7 +57,10 @@ CREATE TABLE IF NOT EXISTS devices (
   auth   TEXT,
   -- pending | trusted | blocked. A module starts 'pending' and may only publish/poll once the
   -- web trusts it; phones default to 'trusted' and the legacy token ignores this column anyway.
-  status TEXT    NOT NULL DEFAULT 'trusted'
+  status TEXT    NOT NULL DEFAULT 'trusted',
+  -- The name the web gave this device (✎ on its card), sealed in the browser under SMS_KEY like
+  -- info, so the server never sees it. NULL = use the device's own name. ALTER-added by setup.sh.
+  label  TEXT
 );
 
 -- Web deletes that must be mirrored onto the phones. When a message is deleted on the web, its

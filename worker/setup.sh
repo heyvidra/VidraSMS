@@ -70,6 +70,7 @@ migrate() {
 }
 migrate "ALTER TABLE devices ADD COLUMN auth TEXT"
 migrate "ALTER TABLE devices ADD COLUMN status TEXT NOT NULL DEFAULT 'trusted'"
+migrate "ALTER TABLE devices ADD COLUMN label TEXT"
 
 echo "==> 设置密钥"
 # Secrets cannot be read back, so regenerating the token on every run would silently

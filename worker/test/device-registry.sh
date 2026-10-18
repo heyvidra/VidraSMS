@@ -360,6 +360,19 @@ expect "8. hex-id phone polls → 200 []" "$CODE $BODY" "200 []"
 req POST "/api/register?dev=$PHONE" "${AUTH[@]}" --data-binary "$BLOB"
 expect "8. module registering under a phone's id → 409" "$CODE" 409
 
+# --- 8.5 rename (✎): a sealed label, shape-checked only -------------------------------------
+req POST "/api/device/label" "${JSON[@]}" --data "{\"id\":\"$DEV\",\"label\":\"v1:abc\"}"
+expect "8.5 rename without a session → 401" "$CODE" 401
+req POST "/api/device/label" "${WEB[@]}" "${JSON[@]}" --data "{\"id\":\"$DEV\",\"label\":\"plain name\"}"
+expect "8.5 an unsealed label → 400 (the server must only ever hold ciphertext)" "$CODE" 400
+req POST "/api/device/label" "${WEB[@]}" "${JSON[@]}" --data "{\"id\":\"$DEV\",\"label\":\"v1:sealed-name\"}"
+expect "8.5 sealed label → ok" "$CODE $BODY" '200 {"ok":true}'
+req GET "/api/status" "${WEB[@]}"
+expect "8.5 /api/status carries it" "$(jget "$BODY" "j.devices.find(d => d.id === '$DEV').label")" "v1:sealed-name"
+req POST "/api/device/label" "${WEB[@]}" "${JSON[@]}" --data "{\"id\":\"$DEV\",\"label\":\"\"}"
+req GET "/api/status" "${WEB[@]}"
+expect "8.5 empty label restores the default (NULL)" "$(jget "$BODY" "j.devices.find(d => d.id === '$DEV').label")" "null"
+
 # --- 9. forget, then register again ---------------------------------------------------------
 req POST "/api/device/forget" "${WEB[@]}" "${JSON[@]}" --data "{\"id\":\"$DEV\"}"
 expect "9. forget → ok" "$CODE $BODY" '200 {"ok":true}'
@@ -369,6 +382,11 @@ expect "9. register again → pending again" "$CODE $BODY" '200 {"status":"pendi
 
 # --- page sanity ---------------------------------------------------------------------------
 PAGE=$(curl -s "$BASE/" "${WEB[@]}")
+# The page script lives inside a template literal, so `node --check src/index.js` never parses
+# it: check the script exactly as served.
+node -e 'const s=require("fs").readFileSync(0,"utf8"); const m=s.match(/<script>([\s\S]*?)<\/script>/); require("fs").writeFileSync(process.argv[1], m ? m[1] : "")' "$TMP/page.js" <<<"$PAGE"
+[ -s "$TMP/page.js" ] && node --check "$TMP/page.js" 2>"$TMP/page.err" && pass "page script parses as served" || fail "page script does not parse" "$(head -5 "$TMP/page.err")"
+grep -q -- '/api/device/label' <<<"$PAGE" && grep -q -- 'sealObj({ n: t })' <<<"$PAGE" && pass "page has ✎ rename, sealed" || fail "page lacks the sealed rename"
 # 短信指令 (DESIGN-6): the composer must be reachable from BOTH the ⋯ menu and a module card,
 # it must carry its own QR encoder (no CDN — the whole point is that nothing else is reachable),
 # and it must build an SMSTO: payload.
