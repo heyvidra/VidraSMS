@@ -402,7 +402,10 @@ local function ws_once(base)
   local c = websocket.create(nil, (base:gsub("^http", "ws")) .. "/api/ws?dev=" .. dev_id, WS_PING_S)
   if not c then log.warn("gw", "websocket.create failed"); return 0 end
   ws, ws_base = c, base
-  c:headers({ Authorization = "Bearer " .. tostring(dev_secret) })
+  -- The STRING form, never a table: for a table the firmware percent-encodes " -._*" in every
+  -- value, so the line went out as "Authorization:Bearer%20…" and the Worker answered 403 to
+  -- every upgrade (seen on the board, V2054). A string is copied verbatim.
+  c:headers("Authorization: Bearer " .. tostring(dev_secret) .. "\r\n")
   c:on(function(_, ev, data)
     if ev == "conack" then
       ws_up = true

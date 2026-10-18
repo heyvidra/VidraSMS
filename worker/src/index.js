@@ -459,14 +459,12 @@ const app = {
       if (!(await sessionValid(request, env))) {
         return new Response('{"error":"unauthorized"}', { status: 401, headers: { "Content-Type": "application/json" } });
       }
+      // Newest schema first. Code deployed ahead of setup.sh's ALTERs must not blank the strip:
+      // each missing column only drops what it carries (the label, then the module registry).
       let results;
-      try {
-        ({ results } = await env.DB.prepare(
-          "SELECT id, ts, info, status, (auth IS NOT NULL) AS module FROM devices ORDER BY ts DESC"
-        ).all());
-      } catch {
-        // Code deployed ahead of setup.sh's ALTERs: the phones' strip must not go blank for that.
-        ({ results } = await env.DB.prepare("SELECT id, ts, info FROM devices ORDER BY ts DESC").all());
+      for (const cols of ["id, ts, info, status, (auth IS NOT NULL) AS module, label",
+                          "id, ts, info, status, (auth IS NOT NULL) AS module", "id, ts, info"]) {
+        try { ({ results } = await env.DB.prepare(`SELECT ${cols} FROM devices ORDER BY ts DESC`).all()); break; } catch {}
       }
       const legacy = await env.DB.prepare("SELECT v FROM meta WHERE k='beat'").first();
       return Response.json({ devices: results || [], beat: legacy ? Number(legacy.v) : 0 });
@@ -480,6 +478,20 @@ const app = {
       const b = await request.json().catch(() => null);
       if (!b?.id) return new Response('{"error":"bad"}', { status: 400 });
       await env.DB.prepare("DELETE FROM devices WHERE id = ?").bind(String(b.id)).run();
+      return Response.json({ ok: true });
+    }
+    // Web renames a device (phone or module). The name arrives sealed under SMS_KEY by the browser,
+    // like the device's own info, so all the server checks is the shape; "" restores the default.
+    if (request.method === "POST" && path === "/api/device/label") {
+      if (!(await sessionValid(request, env))) {
+        return new Response('{"error":"unauthorized"}', { status: 401, headers: { "Content-Type": "application/json" } });
+      }
+      const b = await request.json().catch(() => null);
+      const label = typeof b?.label === "string" ? b.label : null;
+      if (!b?.id || label === null || label.length > 512 || (label && !label.startsWith("v1:"))) {
+        return new Response('{"error":"bad"}', { status: 400 });
+      }
+      await env.DB.prepare("UPDATE devices SET label=? WHERE id=?").bind(label || null, String(b.id).slice(0, 64)).run();
       return Response.json({ ok: true });
     }
     // Phone reports the result of a send.
@@ -1441,8 +1453,9 @@ li.fresh{background:var(--fresh);border-color:var(--fresh-line)}
   border:0;background:none;color:var(--muted);cursor:pointer;padding:2px 6px;border-radius:6px;
   font-size:15px;line-height:1;opacity:0;transition:opacity .15s,color .15s,background .15s;flex:none;
 }
-li:hover .del,li:focus-within .del{opacity:1}
+li:hover .del,li:focus-within .del,.dev:hover .del,.dev:focus-within .del{opacity:1}
 .del:hover{color:var(--danger);background:color-mix(in srgb,var(--danger) 12%,transparent)}
+.del.ren:hover{color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,transparent)}
 @media (hover:none){.del{opacity:.55}}
 /* Phones: keep the ONE compact row — stacking the cards full-width pushed the messages off the
    screen, which is the very thing the strip exists to avoid. Just make it discoverable that the
@@ -1799,10 +1812,11 @@ async function loadKey(){
 
 // Encrypt {to, body, sim} for the outbound queue in the same v1: format the phone decrypts.
 // sim is "" (default), "0" (SIM 1) or "1" (SIM 2).
-async function sealForSend(to, body, sim){
+async function sealForSend(to, body, sim){ return sealObj({ to, body, sim }); }
+async function sealObj(obj){
   if (!cryptoKey) throw new Error("未设置密钥");
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const pt = new TextEncoder().encode(JSON.stringify({ to, body, sim }));
+  const pt = new TextEncoder().encode(JSON.stringify(obj));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, cryptoKey, pt));
   const buf = new Uint8Array(iv.length + ct.length); buf.set(iv); buf.set(ct, iv.length);
   return "v1:" + btoa(String.fromCharCode(...buf));
@@ -2187,8 +2201,11 @@ async function renderBeat(){
   for (const d of devs) {
     let info = null;
     if (d.info && cryptoKey) { try { info = await openSend(d.info); } catch {} }
+    // The web's own name for it (✎) wins over what the device calls itself.
+    let label = null;
+    if (d.label && cryptoKey) { try { label = (await openSend(d.label))?.n || null; } catch {} }
     next.set(d.id, {
-      id: d.id, ts: d.ts, name: info?.n || ("设备 " + d.id.slice(0, 4)),
+      id: d.id, ts: d.ts, name: label || info?.n || ("设备 " + d.id.slice(0, 4)),
       sims: Array.isArray(info?.s) ? info.s : [], caps: info?.c || null, gaps: info?.g || null, ver: info?.v || null, tr: info?.t || null, os: info?.os || null, ls: info?.ls || null,
       cap: info?.cap || null, pp: info?.pp || null, ln: info?.ln || null,
       // Module registry: status is server-side (the web sets it); the rest is the module's own
@@ -2307,7 +2324,22 @@ async function renderBeat(){
       });
       renderBeat();
     };
-    top.append(dot, name, forget);
+    // Every module calls itself "Air780EHV" (config NAME), so the web needs its own name for it.
+    const ren = document.createElement("button");
+    ren.className = "del ren"; ren.textContent = "✎"; ren.title = "改名";
+    ren.onclick = async () => {
+      if (!cryptoKey) { alert("先在右上角「密钥」里填上 SMS_KEY 才能改名（名字和其它设备信息一样加密存放）"); return; }
+      const v = prompt("给这台设备起个名字（留空恢复默认）", d.name);
+      if (v === null) return;
+      const t = v.trim().slice(0, 40);
+      const r = await fetch("/api/device/label", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: d.id, label: t ? await sealObj({ n: t }) : "" }),
+      });
+      if (!r.ok) { alert("改名失败（" + r.status + "）"); return; }
+      renderBeat();
+    };
+    top.append(dot, name, ren, forget);
     const sub = document.createElement("div"); sub.className = "dev-sub";
     // The second state the user asked for, independent of the dot: can this phone still receive
     // and forward? Red when no capture path is armed (a real fault); green otherwise — and when it

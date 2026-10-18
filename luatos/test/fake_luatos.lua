@@ -653,7 +653,19 @@ function fake.ws_install()
   websocket = {}
   function websocket.create(_, url, keepalive)
     local c = { url = url, keepalive = keepalive }
-    function c:headers(h) self.hdrs = h; return true end
+    -- What the firmware puts on the wire (luat_lib_websocket.c l_websocket_headers): a string
+    -- verbatim; a table as "name:value\r\n" with " -._*" in the value percent-encoded.
+    function c:headers(h)
+      if type(h) == "table" then
+        local s = ""
+        for k, v in pairs(h) do
+          s = s .. k .. ":" .. tostring(v):gsub("[ %-%._%*]", function(ch) return string.format("%%%02X", ch:byte()) end) .. "\r\n"
+        end
+        h = s
+      end
+      self.hdrs = h
+      return true
+    end
     function c:on(cb) self.cb = cb end
     function c:connect()
       fake.ws_connects = fake.ws_connects + 1
