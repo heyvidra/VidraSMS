@@ -35,13 +35,13 @@ zip 里 **4 个文件**：
 | `gcm.lua` | 加密。可网页 OTA。 |
 | `config.lua` | **`SMS_KEY` 必填**；`BASES` / `TOPIC` / `NAME` / `POLL_MS` / `CA_PEM` 可选（默认值写死在 `main.lua`）。短信指令不用配置，见 §5。 |
 
-底层固件 `LuatOS-SoC_V2052_Air780EHV_101.soc` 你自己从合宙官网下（§2），**不放进 zip**。
+底层固件 `LuatOS-SoC_V2054_Air780EHV_101.soc` 你自己从合宙官网下（§2），**不放进 zip**。
 `pack.sh` 会拒绝空的 / 占位的 / 全 0 的 `SMS_KEY`。**zip 里含密钥**，只发给帮你刷机的人；`config.lua` 和
 `dist/` 都在根 `.gitignore` 里。
 
 给卖家的话（`pack.sh` 也会打印）：
 
-> 麻烦用 Luatools 刷一下：新建项目 → 底层选 `LuatOS-SoC_V2052_Air780EHV_101.soc`（我自己提供）→
+> 麻烦用 Luatools 刷一下：新建项目 → 底层选 `LuatOS-SoC_V2054_Air780EHV_101.soc`（我自己提供）→
 > 添加 zip 里的 4 个脚本（`main.lua`、`gw.lua`、`gcm.lua`、`config.lua`）→ 勾选「添加默认lib」→
 > 点「下载底层和脚本」→ 下载完在日志里看到 `smsgw` 字样即可。刷完插卡通电即可，不用配置。
 
@@ -62,7 +62,7 @@ zip 里 **4 个文件**：
 
 ## 2. 固件（选 101）
 
-刷 **`LuatOS-SoC_V2052_Air780EHV_101.soc`**。变体 101 带齐了本项目要的东西：
+刷 **`LuatOS-SoC_V2054_Air780EHV_101.soc`**。变体 101 带齐了本项目要的东西：
 
 - **`cc` 电话模块** —— 未接来电转发要用它监听 `CC_IND`；
 - **电信短信 / VoLTE 短信**接收（选型表 `sms` 行：`✓ 支持电信`）；
@@ -81,17 +81,23 @@ zip 里 **4 个文件**：
 而且**失败是静默的** —— 一切看着正常，短信就是不来。
 
 固件在合宙资料中心的 [Air780EHV 固件版本页](https://docs.openluat.com/air780ehv/luatos/firmware/version/)
-下载，目录 `https://cdn18.luatos.com/files/Air780EHV/LuatOS_Air780EHV/LuatOS-SoC_V2052_Air780EHV/`，
-拿 `_101.soc` 那个（11,940,814 字节，
-sha256 `4a4f1ba3e594ff505091eab9862885194d1512c7c07af6ecfc6b2f05feb6aa5d`）。
+下载，目录 `https://cdn18.luatos.com/files/Air780EHV/LuatOS_Air780EHV/LuatOS-SoC_V2054_Air780EHV/`，
+拿 `_101.soc` 那个（10,889,089 字节，
+sha256 `7a53f28c5c36fad8c621af92c8a44175f59b1e854a89e95d9a940a33df64ea72`）。
 **别用 V2024 之前的版本** —— 那之前 LuatOS 的 AES-GCM 连 IV 都不生效（本项目绕开了它，
 但没必要踩老固件的坑）。
+
+**也别用 V2052** —— 2026-10-18 在板子上实测：每次开机 DNS 解析完、第一次 HTTPS 握手就死机
+（Luatools 弹「模组已经死机」并存 ramdump），救援模式也一样，所以模组**从来注册不上**，网页上什么都没有，
+`boot_fail` 一路涨到二十几。V2052 改过 mbedtls 的 ECDH 握手，V2054 的更新记录里正好有
+`fix: mbedtls,开启椭圆算法加速时改大tcpip线程栈`；换成 V2054 同一块板子、同一套脚本立刻正常。
+（Cloudflare 的证书和密钥交换都是椭圆曲线，所以每次握手必中。）
 
 ### Luatools 步骤（自己刷时）
 
 1. 装 **Luatools**（合宙官方下载/烧录工具，Windows）。
 2. USB 连上模组，Luatools 会自动认端口。
-3. **第一次**：选「下载底层和脚本」，底层选刚下的 `LuatOS-SoC_V2052_Air780EHV_101.soc`，
+3. **第一次**：选「下载底层和脚本」，底层选刚下的 `LuatOS-SoC_V2054_Air780EHV_101.soc`，
    脚本添加 `main.lua` / `gw.lua` / `gcm.lua` / `config.lua`，勾选「添加默认lib」，下载。
 4. 之后**不需要再连 USB**：改 `gw.lua` / `gcm.lua` 用网页「更新脚本」（§4）。
    真要用线刷也只需「下载脚本」，秒传。
@@ -211,7 +217,7 @@ bash luatos/sms-sign.sh "$(bash luatos/test/ota-sign.sh gw)"    # → #ota gw <�
 
 | 指令 | 作用 |
 |---|---|
-| `#status` | 回一条：`2.2.0 csq=20 net=1 ip=10.x.x.x q=0 gcm=ok fw=V2052 trust=trusted ota=- boot=0 ws=up utc=14 win=fast`（信号 / 网络 / IP / 排队条数 / 加密自检 / 固件 / **信任状态** / OTA 副本 / 启动计数 / **WebSocket 状态** / **模块看到的 UTC 小时** / **当前档位**）。`utc=` 和 `win=` 是判断 RTC 是否走偏的唯一手段 —— 时钟错了两个窗口一起平移，症状只有「有些天指令好像慢一点」。这行由 `gw.lua` 提供（`_G.gw_status_line`）；救援模式或 `gw.lua` 没起来时由 `main.lua` 自己回 `RESCUE boot_fail=… ota=… fw=… ver=… dev=…`。 |
+| `#status` | 回一条：`2.2.0 csq=20 net=1 ip=10.x.x.x q=0 gcm=ok fw=V2054 trust=trusted ota=- boot=0 ws=up utc=14 win=fast`（信号 / 网络 / IP / 排队条数 / 加密自检 / 固件 / **信任状态** / OTA 副本 / 启动计数 / **WebSocket 状态** / **模块看到的 UTC 小时** / **当前档位**）。`utc=` 和 `win=` 是判断 RTC 是否走偏的唯一手段 —— 时钟错了两个窗口一起平移，症状只有「有些天指令好像慢一点」。这行由 `gw.lua` 提供（`_G.gw_status_line`）；救援模式或 `gw.lua` 没起来时由 `main.lua` 自己回 `RESCUE boot_fail=… ota=… fw=… ver=… dev=…`。 |
 | `#reboot` | 重启（主动重启，清零计数，不回复）。 |
 | `#url https://a,https://b` | 等价于网页「改域名」：校验、存 fskv、回 `url ok rebooting`、5 秒后重启。整条短信已经用 `SMS_KEY` 签过了，所以这里不用再套一层网页那种 `bases` 签名。 |
 | `#url reset` | 清掉上面的覆盖和两个标记，回到 `config.lua` / 默认域名，重启（不回复）。 |
@@ -390,7 +396,8 @@ SIM 卡按 **200 MB/月** 设计。单次轮询实测约 **5.2 KB**（其中 TLS
 | 连着 | 每 5 分钟一次（`WS_POLL_MS`，只为保活检测和网页的「在线」），平时靠推送 | ping 约 13 MB/月（60 秒一次，`WS_PING_S` 可调）+ 重连和上报几 MB |
 | 断开 | 上表的 HTTPS 排班 | 约 96 MB/月（和以前一样） |
 
-**以上都还没在板子上测过**，是按帧大小估的。刷上之后要看的：`#status` 里的 `ws=up/down/off`、
+**流量数字还没在板子上测过**，是按帧大小估的。已经实测的（2026-10-18，V2054）：socket 被拒时
+全部请求照常走 HTTPS（注册、信任、收发短信都通），重连退避按 30 → 60 → 120 秒翻倍。还要看的：`#status` 里的 `ws=up/down/off`、
 日志里 `ws up` / `ws down:` 多久一次（电信 NAT 多久回收空闲连接，决定 `WS_PING_S` 能不能放到 120）、
 一天后卡上实际用了多少流量。
 
@@ -399,4 +406,7 @@ SIM 卡按 **200 MB/月** 设计。单次轮询实测约 **5.2 KB**（其中 TLS
 - 配了 `CA_PEM` 就**不开** WebSocket：`websocket.create` 不收 CA，开了等于悄悄放弃你要的证书校验。
   `config.lua` 里写 `WS = false` 也能手动关掉。
 - 模组收包缓冲在没有 PSRAM 的固件上只有 8 KB，超过就断线，所以 Hub 把回复切成 2000 字符一片。
+  （Air780EHV 实测有 PSRAM：开机日志 `loadlibs luavm 4194296`，缓冲是 32 KB；分片照做，不依赖这一点。）
+- 鉴权头必须用**字符串**传给 `wsc:headers()`：传 table 时固件会把值里的 ` -._*` 百分号编码，
+  `Bearer <secret>` 变成 `Bearer%20<secret>`，每次升级都 403（第一版 2.2.0 就栽在这，HTTPS 照常工作所以只是变慢）。
 - `main.lua`（救援模式）只走 HTTPS，不受这里任何影响。
